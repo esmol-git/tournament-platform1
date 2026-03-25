@@ -32,6 +32,10 @@ function authBruteForcePath(context: ExecutionContext): string {
   return raw.split('?')[0];
 }
 
+function isOptionsRequest(context: ExecutionContext): boolean {
+  return context.switchToHttp().getRequest()?.method === 'OPTIONS';
+}
+
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -80,6 +84,7 @@ function authBruteForcePath(context: ExecutionContext): string {
               limit: 5,
               // Только login / register / refresh (жёсткий лимит; refresh — @Throttle 10).
               skipIf: (context: ExecutionContext) => {
+                if (isOptionsRequest(context)) return true;
                 const path = authBruteForcePath(context);
                 return !/^\/auth\/(login|register|refresh)$/.test(path);
               },
@@ -89,6 +94,7 @@ function authBruteForcePath(context: ExecutionContext): string {
               ttl: seconds(60),
               limit: globalLimit,
               // Общий «потолок» на IP против сканирования; админка обычно укладывается в 2000/мин.
+              skipIf: (context: ExecutionContext) => isOptionsRequest(context),
             },
           ],
         };

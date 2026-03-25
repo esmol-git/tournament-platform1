@@ -25,7 +25,11 @@ async function bootstrap() {
   app.useGlobalFilters(new AllExceptionsFilter());
 
   const isProd = process.env.NODE_ENV === 'production';
-  const allowedOriginPatterns = [/^https?:\/\/([a-z0-9-]+)\.lvh\.me(:\d+)?$/i];
+  const allowedOriginPatterns = [
+    /^https?:\/\/([a-z0-9-]+)\.lvh\.me(:\d+)?$/i,
+    // Публичный сайт по поддоменам: https://<tenant>.tournament-platform.ru
+    /^https:\/\/([a-z0-9-]+)\.tournament-platform\.ru(:\d+)?$/i,
+  ];
   const allowedOrigins = new Set([
     'http://localhost:3000',
     'http://localhost:5173',
@@ -66,13 +70,20 @@ async function bootstrap() {
             return;
           }
           const isPatternAllowed = allowedOriginPatterns.some((re) => re.test(origin));
-          callback(
-            isPatternAllowed ? null : new Error('Not allowed by CORS'),
-            isPatternAllowed,
-          );
+          // Не передавать Error в callback — иначе express/cors вызывает next(err) и ответ 500 на preflight.
+          callback(null, isPatternAllowed);
         }
       : true,
     credentials: true,
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Accept',
+      'X-Requested-With',
+      'X-Request-Id',
+    ],
+    exposedHeaders: ['X-Request-Id'],
   });
 
   app.useGlobalPipes(
