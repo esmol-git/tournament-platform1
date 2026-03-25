@@ -10,6 +10,7 @@ export default <Partial<Config>>{
     './plugins/**/*.{js,ts}',
     './nuxt.config.{js,ts}',
   ],
+  /** Утилиты с префиксом `dark:` (не `dark-mode:`) применяются при `class="dark-mode"` на `<html>`. */
   darkMode: ['selector', '[class~="dark-mode"]'],
   plugins: [PrimeUI],
 }

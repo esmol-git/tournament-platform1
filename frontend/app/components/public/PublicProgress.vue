@@ -1,20 +1,21 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { useApiUrl } from '~/composables/useApiUrl'
-import { useAuth } from '~/composables/useAuth'
+import { computed, ref, watch } from 'vue'
 
 import type { MatchRow, TableRow, TournamentDetails } from '~/types/tournament-admin'
+import { usePublicTournamentFetch } from '~/composables/usePublicTournamentFetch'
+import { usePublicTenantContext } from '~/composables/usePublicTenantContext'
 
 const props = defineProps<{
   tournamentId: string
+  groupId?: string | null
 }>()
 
-const { apiUrl } = useApiUrl()
-const { token, syncWithStorage, authFetch } = useAuth()
+const { tenantSlug, ensureTenantResolved, tenantNotFound } = usePublicTenantContext()
+const tenant = tenantSlug
+const { fetchTable, fetchTournamentDetail } = usePublicTournamentFetch()
 
 const loading = ref(false)
 const errorText = ref('')
-const authRequired = ref(false)
 
 const rows = ref<TableRow[]>([])
 const matches = ref<MatchRow[]>([])
@@ -45,7 +46,13 @@ const resultsByTeamId = computed<Record<string, TeamResultToken[]>>(() => {
   // Ensure stable ordering in UI even if some teams have no results.
   for (const r of sortedRows.value) map[r.teamId] = []
 
-  const played = (matches.value ?? []).filter((m) => m.homeScore != null && m.awayScore != null)
+  const played = (matches.value ?? [])
+    .filter((m) => {
+      if (m.stage === 'PLAYOFF') return false
+      if (props.groupId) return m.groupId === props.groupId
+      return true
+    })
+    .filter((m) => m.homeScore != null && m.awayScore != null)
   played.sort((a, b) => {
     const at = a.startTime ? new Date(a.startTime).getTime() : 0
     const bt = b.startTime ? new Date(b.startTime).getTime() : 0
@@ -89,30 +96,20 @@ async function load() {
   matches.value = []
   if (!props.tournamentId) return
 
-  if (!token.value) {
-    authRequired.value = true
+  await ensureTenantResolved()
+  if (tenantNotFound.value) {
+    errorText.value = 'Тенант не найден. Проверьте ссылку.'
     return
   }
-
-  authRequired.value = false
   loading.value = true
   try {
     const [table, details] = await Promise.all([
-      authFetch<TableRow[]>(apiUrl(`/tournaments/${props.tournamentId}/table`), {
-        headers: { Authorization: `Bearer ${token.value}` },
-      }),
-      authFetch<TournamentDetails>(apiUrl(`/tournaments/${props.tournamentId}`), {
-        headers: { Authorization: `Bearer ${token.value}` },
-      }),
+      fetchTable(tenant.value, props.tournamentId, props.groupId ?? undefined),
+      fetchTournamentDetail(tenant.value, props.tournamentId),
     ])
     rows.value = table
     matches.value = details.matches ?? []
-  } catch (e: any) {
-    const status = e?.response?.status ?? e?.statusCode
-    if (status === 401) {
-      authRequired.value = true
-      return
-    }
+  } catch {
     errorText.value = 'Не удалось загрузить прогресс.'
   } finally {
     loading.value = false
@@ -120,16 +117,13 @@ async function load() {
 }
 
 watch(
-  () => props.tournamentId,
+  () => [props.tournamentId, props.groupId] as const,
   () => {
     void load()
   },
   { immediate: true },
 )
 
-onMounted(() => {
-  syncWithStorage()
-})
 </script>
 
 <template>
@@ -141,11 +135,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <div v-if="authRequired" class="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900">
-      Для просмотра нужен вход в админку.
-    </div>
-
-    <div v-else-if="errorText" class="mt-4 rounded-xl border border-red-300 bg-red-50 p-4 text-red-900">
+    <div v-if="errorText" class="mt-4 rounded-xl border border-red-300 bg-red-50 p-4 text-red-900">
       {{ errorText }}
     </div>
 

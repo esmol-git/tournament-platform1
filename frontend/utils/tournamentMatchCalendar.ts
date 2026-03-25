@@ -8,6 +8,23 @@ import type {
 
 type TournamentGroup = TournamentDetails['groups'][number]
 
+function playoffRoundDisplayRank(round?: MatchRow['playoffRound']) {
+  switch (round) {
+    case 'ROUND_OF_16':
+      return 10
+    case 'QUARTERFINAL':
+      return 20
+    case 'SEMIFINAL':
+      return 30
+    case 'THIRD_PLACE':
+      return 40
+    case 'FINAL':
+      return 50
+    default:
+      return 0
+  }
+}
+
 /** Группировка матчей по турам для режима «как тур» в календаре. */
 export function buildTourSectionsFromMatches(matches: MatchRow[]): TourSection[] {
   const groups = new Map<string, MatchRow[]>()
@@ -58,7 +75,18 @@ export function buildTourSectionsFromMatches(matches: MatchRow[]): TourSection[]
   return sections.sort((a, b) => {
     const ta = a.matches.length ? new Date(a.matches[0].startTime).getTime() : 0
     const tb = b.matches.length ? new Date(b.matches[0].startTime).getTime() : 0
-    return ta - tb || a.key.localeCompare(b.key)
+    if (ta !== tb) return ta - tb
+
+    const aSample = a.matches[0]
+    const bSample = b.matches[0]
+    const aStage = aSample?.stage ?? 'GROUP'
+    const bStage = bSample?.stage ?? 'GROUP'
+    if (aStage === 'PLAYOFF' && bStage === 'PLAYOFF') {
+      const ar = playoffRoundDisplayRank(aSample?.playoffRound)
+      const br = playoffRoundDisplayRank(bSample?.playoffRound)
+      if (ar !== br) return ar - br
+    }
+    return a.key.localeCompare(b.key)
   })
 }
 
@@ -152,7 +180,16 @@ export function buildCalendarRoundsFromMatches(
       (min, m) => Math.min(min, new Date(m.startTime).getTime()),
       Number.POSITIVE_INFINITY,
     )
-    return aMin - bMin || a.localeCompare(b)
+    if (aMin !== bMin) return aMin - bMin
+
+    const [aStage, , , aPlayoffRound = ''] = a.split(':')
+    const [bStage, , , bPlayoffRound = ''] = b.split(':')
+    if (aStage === 'PLAYOFF' && bStage === 'PLAYOFF') {
+      const ar = playoffRoundDisplayRank(aPlayoffRound as MatchRow['playoffRound'])
+      const br = playoffRoundDisplayRank(bPlayoffRound as MatchRow['playoffRound'])
+      if (ar !== br) return ar - br
+    }
+    return a.localeCompare(b)
   })
 
   return buckets.map((bucket, idx) => {

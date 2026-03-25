@@ -1,27 +1,27 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useApiUrl } from '~/composables/useApiUrl'
-import { useAuth } from '~/composables/useAuth'
+import { usePublicTournamentFetch } from '~/composables/usePublicTournamentFetch'
 import type { TournamentDetails, CalendarRound, CalendarViewMode } from '~/types/tournament-admin'
 import { buildCalendarRoundsFromMatches } from '~/utils/tournamentMatchCalendar'
+import { formatMatchScoreDisplay } from '~/utils/tournamentAdminUi'
 
 import PublicHeader from '~/app/components/public/PublicHeader.vue'
 import PublicTournamentSidebar from '~/app/components/public/PublicTournamentSidebar.vue'
 import type { TournamentRow } from '~/types/admin/tournaments-index'
+import { usePublicTenantContext } from '~/composables/usePublicTenantContext'
 
 definePageMeta({ layout: 'public' })
 
 const route = useRoute()
 const router = useRouter()
-const { apiUrl } = useApiUrl()
-const { token, syncWithStorage, authFetch } = useAuth()
+const { loadAllTournaments, fetchTournamentDetail } = usePublicTournamentFetch()
 
-const tenant = computed(() => route.params.tenant as string)
-
-const authRequired = ref(false)
+const { tenantSlug, selectedTid, ensureTenantResolved, tenantNotFound } = usePublicTenantContext()
+const tenant = tenantSlug
 const errorText = ref('')
 const loading = ref(false)
+const pageReady = ref(false)
 
 const tournaments = ref<TournamentRow[]>([])
 const selectedTournamentId = ref<string>('')
@@ -31,12 +31,17 @@ const selectedTournament = computed(() =>
 
 const calendarLoading = ref(false)
 const calendarRounds = ref<CalendarRound[]>([])
+const showPageSkeleton = computed(() => {
+  return (
+    !pageReady.value ||
+    loading.value ||
+    (calendarLoading.value && !calendarRounds.value.length)
+  )
+})
 const calendarViewMode = ref<CalendarViewMode>('grouped')
-
-function getTidFromQuery(): string | null {
-  const tid = route.query.tid
-  return typeof tid === 'string' && tid.trim() ? tid : null
-}
+const matchStatsOpen = ref(false)
+const matchStatsTab = ref(0)
+const selectedMatchForStats = ref<TournamentDetails['matches'][number] | null>(null)
 
 function syncTidToQuery(nextId: string | null) {
   const q: Record<string, any> = { ...route.query }
@@ -45,14 +50,14 @@ function syncTidToQuery(nextId: string | null) {
   void router.replace({ query: q })
 }
 
-selectedTournamentId.value = getTidFromQuery() ?? ''
-
 const tournamentStatusLabel = computed(() => {
   switch (selectedTournament.value?.status) {
     case 'ACTIVE':
       return 'Идет'
-    case 'ARCHIVED':
+    case 'COMPLETED':
       return 'Завершен'
+    case 'ARCHIVED':
+      return 'Архив'
     case 'DRAFT':
       return 'Черновик'
     default:
@@ -71,55 +76,96 @@ const dateLabel = computed(() => {
   return 'Даты не указаны'
 })
 
-async function fetchTournaments() {
-  if (!token.value) {
-    authRequired.value = true
-    tournaments.value = []
-    calendarRounds.value = []
-    return
-  }
+function sideLabel(side?: 'HOME' | 'AWAY' | null) {
+  if (side === 'HOME') return 'Хозяева'
+  if (side === 'AWAY') return 'Гости'
+  return '—'
+}
 
-  authRequired.value = false
+function eventMinuteLabel(minute?: number | null) {
+  if (minute == null) return '—'
+  return `${minute}'`
+}
+
+function openMatchStats(m: TournamentDetails['matches'][number]) {
+  selectedMatchForStats.value = m
+  matchStatsTab.value = 0
+  matchStatsOpen.value = true
+}
+
+const selectedMatchGoals = computed(() =>
+  (selectedMatchForStats.value?.events ?? [])
+    .filter((e) => e.type === 'GOAL')
+    .sort((a, b) => (a.minute ?? 0) - (b.minute ?? 0)),
+)
+
+const selectedMatchCards = computed(() =>
+  (selectedMatchForStats.value?.events ?? [])
+    .filter((e) => e.type === 'CARD')
+    .sort((a, b) => (a.minute ?? 0) - (b.minute ?? 0)),
+)
+
+const selectedMatchSubs = computed(() =>
+  (selectedMatchForStats.value?.events ?? [])
+    .filter((e) => e.type === 'SUBSTITUTION')
+    .sort((a, b) => (a.minute ?? 0) - (b.minute ?? 0)),
+)
+
+const selectedMatchSummary = computed(() => {
+  const m = selectedMatchForStats.value
+  if (!m) return null
+  const bySide = (type: 'GOAL' | 'CARD' | 'SUBSTITUTION', side: 'HOME' | 'AWAY') =>
+    (m.events ?? []).filter((e) => e.type === type && e.teamSide === side).length
+  return {
+    goalsHome: bySide('GOAL', 'HOME'),
+    goalsAway: bySide('GOAL', 'AWAY'),
+    cardsHome: bySide('CARD', 'HOME'),
+    cardsAway: bySide('CARD', 'AWAY'),
+    subsHome: bySide('SUBSTITUTION', 'HOME'),
+    subsAway: bySide('SUBSTITUTION', 'AWAY'),
+    totalEvents: (m.events ?? []).length,
+  }
+})
+
+async function fetchTournaments() {
   errorText.value = ''
   loading.value = true
   try {
-    const data = await authFetch<TournamentRow[]>(
-      apiUrl(`/tenants/${tenant.value}/tournaments`),
-      { headers: { Authorization: `Bearer ${token.value}` } },
-    )
-    tournaments.value = data
+    const loaded = await loadAllTournaments(tenant.value)
+
+    tournaments.value = loaded
+    const ids = new Set(loaded.map((t) => t.id))
+    if (selectedTournamentId.value && !ids.has(selectedTournamentId.value)) {
+      selectedTournamentId.value = ''
+    }
     if (!selectedTournamentId.value) {
-      const active = data.find((t) => t.status === 'ACTIVE')
-      selectedTournamentId.value = active?.id ?? data[0]?.id ?? ''
+      selectedTournamentId.value = loaded[0]?.id ?? ''
       syncTidToQuery(selectedTournamentId.value || null)
     }
   } catch (e: any) {
+    tournaments.value = []
+    calendarRounds.value = []
     const status = e?.response?.status ?? e?.statusCode
-    if (status === 401) {
-      authRequired.value = true
-      tournaments.value = []
-      calendarRounds.value = []
-      return
-    }
-    errorText.value = 'Не удалось загрузить турниры.'
+    errorText.value =
+      status === 404
+        ? 'Тенант не найден. Проверьте ссылку.'
+        : 'Не удалось загрузить турниры.'
   } finally {
     loading.value = false
   }
 }
 
 async function fetchCalendar() {
-  if (!selectedTournamentId.value || !token.value) {
+  if (!selectedTournamentId.value) {
     calendarRounds.value = []
     return
   }
 
   calendarLoading.value = true
   errorText.value = ''
+  calendarRounds.value = []
   try {
-    const res = await authFetch<TournamentDetails>(
-      apiUrl(`/tournaments/${selectedTournamentId.value}`),
-      { headers: { Authorization: `Bearer ${token.value}` } },
-    )
+    const res = await fetchTournamentDetail(tenant.value, selectedTournamentId.value)
 
     calendarRounds.value = buildCalendarRoundsFromMatches(
       res.matches ?? [],
@@ -139,9 +185,24 @@ watch(selectedTournamentId, () => {
 })
 
 onMounted(async () => {
-  syncWithStorage()
-  await fetchTournaments()
-  await fetchCalendar()
+  try {
+    await ensureTenantResolved()
+
+    if (tenantNotFound.value) {
+      errorText.value = 'Тенант не найден. Проверьте ссылку.'
+      return
+    }
+
+    if (String(route.params.tenant ?? '') !== tenant.value) {
+      await router.replace({ params: { tenant: tenant.value }, query: route.query })
+    }
+
+    selectedTournamentId.value = selectedTid.value ?? ''
+    await fetchTournaments()
+    await fetchCalendar()
+  } finally {
+    pageReady.value = true
+  }
 })
 </script>
 
@@ -151,6 +212,25 @@ onMounted(async () => {
 
     <div class="mx-auto max-w-6xl px-4 py-5 grid grid-cols-1 lg:grid-cols-[1fr_22rem] gap-6">
       <div class="space-y-4">
+        <div v-if="showPageSkeleton" class="space-y-4">
+          <div class="rounded-2xl border border-surface-200 bg-surface-0 p-4">
+            <Skeleton width="16rem" height="2rem" />
+            <Skeleton class="mt-2" width="11rem" height="1rem" />
+            <Skeleton class="mt-4" width="22rem" height="2.75rem" />
+          </div>
+          <div
+            v-for="i in 3"
+            :key="`cal-sk-${i}`"
+            class="rounded-2xl border border-surface-200 bg-surface-0 p-4"
+          >
+            <Skeleton width="13rem" height="1.2rem" />
+            <Skeleton class="mt-2" width="8rem" height="0.9rem" />
+            <Skeleton class="mt-3" width="100%" height="3.25rem" />
+            <Skeleton class="mt-2" width="100%" height="3.25rem" />
+          </div>
+        </div>
+
+        <template v-else>
         <div class="rounded-2xl border border-surface-200 bg-surface-0 p-4">
           <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div class="min-w-0">
@@ -178,14 +258,7 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div
-          v-if="authRequired"
-          class="rounded-2xl border border-amber-300 bg-amber-50 p-5 text-amber-900"
-        >
-          Для просмотра нужно войти в админку.
-        </div>
-
-        <div v-else-if="errorText" class="rounded-2xl border border-red-300 bg-red-50 p-5 text-red-900">
+        <div v-if="errorText" class="rounded-2xl border border-red-300 bg-red-50 p-5 text-red-900">
           {{ errorText }}
         </div>
 
@@ -221,38 +294,41 @@ onMounted(async () => {
                 <div
                   v-for="m in r.matches"
                   :key="m.id"
-                  class="flex items-center justify-between gap-3 rounded-xl border border-surface-200 bg-surface-0 px-3 py-2"
+                  class="rounded-xl border border-surface-200 bg-surface-0 px-3 py-2"
                 >
-                  <div class="min-w-0">
-                    <div class="text-sm font-medium truncate">
-                      {{ m.homeTeam.name }} vs {{ m.awayTeam.name }}
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="min-w-0">
+                      <div class="text-sm font-medium truncate">
+                        {{ m.homeTeam.name }} vs {{ m.awayTeam.name }}
+                      </div>
+                      <div class="text-xs text-muted-color">
+                        {{
+                          new Date(m.startTime).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+                        }}
+                        <span v-if="m.stage">· {{ m.stage === 'GROUP' ? 'Группа' : 'Плей-офф' }}</span>
+                      </div>
                     </div>
-                    <div class="text-xs text-muted-color">
-                      {{
-                        new Date(m.startTime).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
-                      }}
-                      <span v-if="m.stage">· {{ m.stage === 'GROUP' ? 'Группа' : 'Плей-офф' }}</span>
+                    <div class="flex items-center gap-3 shrink-0">
+                      <div class="text-sm font-semibold">
+                        <template v-if="m.homeScore != null && m.awayScore != null">
+                          {{ formatMatchScoreDisplay(m) }}
+                        </template>
+                        <template v-else>—</template>
+                      </div>
+                      <Button
+                        label="Статистика"
+                        size="small"
+                        text
+                        @click="openMatchStats(m)"
+                      />
                     </div>
-                  </div>
-                  <div class="flex items-center gap-3 shrink-0">
-                    <div class="text-sm font-semibold">
-                      <template v-if="m.homeScore != null && m.awayScore != null">
-                        {{ m.homeScore }}:{{ m.awayScore }}
-                      </template>
-                      <template v-else>—</template>
-                    </div>
-                    <NuxtLink
-                      :to="`/${tenant}/match-${m.id}`"
-                      class="text-sm text-primary hover:underline"
-                    >
-                      Детали
-                    </NuxtLink>
                   </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
+        </template>
       </div>
 
       <PublicTournamentSidebar
@@ -262,6 +338,97 @@ onMounted(async () => {
         active="calendar"
       />
     </div>
+    <Dialog
+      :visible="matchStatsOpen"
+      @update:visible="(v) => (matchStatsOpen = v)"
+      modal
+      :draggable="false"
+      :style="{ width: '52rem', maxWidth: '96vw' }"
+      :header="selectedMatchForStats ? `${selectedMatchForStats.homeTeam.name} — ${selectedMatchForStats.awayTeam.name}` : 'Статистика матча'"
+    >
+      <div v-if="selectedMatchForStats" class="space-y-3">
+        <div class="text-sm text-muted-color">
+          {{
+            new Date(selectedMatchForStats.startTime).toLocaleString('ru-RU', {
+              day: '2-digit',
+              month: '2-digit',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit',
+            })
+          }}
+        </div>
+
+        <TabView :activeIndex="matchStatsTab" @update:activeIndex="(v) => (matchStatsTab = v)">
+          <TabPanel header="Общая">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div class="rounded-xl border border-surface-200 bg-surface-50 p-3">
+                <div class="text-xs text-muted-color">Счёт</div>
+                <div class="mt-1 text-lg font-semibold">{{ formatMatchScoreDisplay(selectedMatchForStats) }}</div>
+              </div>
+              <div class="rounded-xl border border-surface-200 bg-surface-50 p-3">
+                <div class="text-xs text-muted-color">События</div>
+                <div class="mt-1 text-lg font-semibold">{{ selectedMatchSummary?.totalEvents ?? 0 }}</div>
+              </div>
+              <div class="rounded-xl border border-surface-200 bg-surface-50 p-3">
+                <div class="text-xs text-muted-color">Голы</div>
+                <div class="mt-1 font-medium">
+                  {{ selectedMatchSummary?.goalsHome ?? 0 }} : {{ selectedMatchSummary?.goalsAway ?? 0 }}
+                </div>
+              </div>
+              <div class="rounded-xl border border-surface-200 bg-surface-50 p-3">
+                <div class="text-xs text-muted-color">Карточки</div>
+                <div class="mt-1 font-medium">
+                  {{ selectedMatchSummary?.cardsHome ?? 0 }} : {{ selectedMatchSummary?.cardsAway ?? 0 }}
+                </div>
+              </div>
+            </div>
+          </TabPanel>
+
+          <TabPanel header="Голы">
+            <div v-if="!selectedMatchGoals.length" class="text-sm text-muted-color">Событий нет.</div>
+            <div v-else class="space-y-2">
+              <div
+                v-for="e in selectedMatchGoals"
+                :key="e.id"
+                class="rounded-lg border border-surface-200 px-3 py-2 text-sm"
+              >
+                <span class="font-medium">{{ eventMinuteLabel(e.minute) }}</span>
+                · {{ sideLabel(e.teamSide) }}
+              </div>
+            </div>
+          </TabPanel>
+
+          <TabPanel header="Карточки">
+            <div v-if="!selectedMatchCards.length" class="text-sm text-muted-color">Событий нет.</div>
+            <div v-else class="space-y-2">
+              <div
+                v-for="e in selectedMatchCards"
+                :key="e.id"
+                class="rounded-lg border border-surface-200 px-3 py-2 text-sm"
+              >
+                <span class="font-medium">{{ eventMinuteLabel(e.minute) }}</span>
+                · {{ sideLabel(e.teamSide) }}
+              </div>
+            </div>
+          </TabPanel>
+
+          <TabPanel header="Замены">
+            <div v-if="!selectedMatchSubs.length" class="text-sm text-muted-color">Событий нет.</div>
+            <div v-else class="space-y-2">
+              <div
+                v-for="e in selectedMatchSubs"
+                :key="e.id"
+                class="rounded-lg border border-surface-200 px-3 py-2 text-sm"
+              >
+                <span class="font-medium">{{ eventMinuteLabel(e.minute) }}</span>
+                · {{ sideLabel(e.teamSide) }}
+              </div>
+            </div>
+          </TabPanel>
+        </TabView>
+      </div>
+    </Dialog>
   </div>
 </template>
 

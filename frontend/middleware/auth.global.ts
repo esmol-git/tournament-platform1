@@ -1,6 +1,11 @@
+import {
+  applyAdminLocale,
+  syncThemeAndAccentFromStore,
+} from '~/composables/useAdminAppearance'
 import { useAuth } from '~/composables/useAuth'
+import { useAdminSettingsStore } from '~/stores/adminSettings'
 
-export default defineNuxtRouteMiddleware((to) => {
+export default defineNuxtRouteMiddleware(async (to) => {
   // Защищаем только маршруты админки, публичные страницы не трогаем
   if (!to.path.startsWith('/admin')) {
     return
@@ -8,7 +13,7 @@ export default defineNuxtRouteMiddleware((to) => {
 
   const { loggedIn, syncWithStorage } = useAuth()
 
-  if (process.client) {
+  if (import.meta.client) {
     syncWithStorage()
   }
 
@@ -20,6 +25,27 @@ export default defineNuxtRouteMiddleware((to) => {
 
   if (loggedIn.value && isAuthPage) {
     return navigateTo('/admin')
+  }
+
+  /**
+   * До монтирования страниц админки подтягиваем ui-settings — иначе первым уходит
+   * запрос данных (players и т.д.), тема с сервера применяется позже и даёт мигание.
+   */
+  if (import.meta.client && loggedIn.value && !isAuthPage) {
+    const adminSettings = useAdminSettingsStore()
+    await adminSettings.fetchFromServerIfLoggedIn()
+    try {
+      syncThemeAndAccentFromStore()
+      const nuxtApp = useNuxtApp()
+      const { locale, setLocale } = useI18n()
+      const code = adminSettings.locale
+      if (locale.value !== code) {
+        setLocale(code)
+      }
+      applyAdminLocale(code, nuxtApp)
+    } catch {
+      /* тема уже применена из стора; i18n может быть недоступен в редких контекстах middleware */
+    }
   }
 })
 

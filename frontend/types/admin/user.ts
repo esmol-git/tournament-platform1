@@ -1,6 +1,7 @@
 /** Строка списка пользователей в админке (`GET /users`) */
 export interface UserRow {
   id: string
+  username: string
   email: string
   name: string
   lastName: string

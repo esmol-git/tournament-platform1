@@ -6,7 +6,9 @@ import { useTenantId } from '~/composables/useTenantId'
 import { useTenantTeamLogo } from '~/composables/useTenantTeamLogo'
 import { PLAYER_POSITION_OPTIONS } from '~/constants/playerPositions'
 import type { TeamPlayerRow, TeamRow } from '~/types/admin/team'
+import { getApiErrorMessage } from '~/utils/apiError'
 import { toYmdLocal as toYmd } from '~/utils/dateYmd'
+import { MIN_SKELETON_DISPLAY_MS, sleepRemainingAfter } from '~/utils/minimumLoadingDelay'
 import { slugifyFromTitle } from '~/utils/slugify'
 
 definePageMeta({ layout: 'admin' })
@@ -17,7 +19,13 @@ const { apiUrl } = useApiUrl()
 const toast = useToast()
 const tenantId = useTenantId()
 
-const loading = ref(false)
+/** true до первого завершённого запроса — иначе при F5 один кадр с пустым списком и «Нет команд». */
+const loading = ref(true)
+/** Скелетон совпадает по числу строк с дефолтным pageSize. */
+const TEAMS_TABLE_SKELETON_ROWS = 10
+const skeletonTeamRows = Array.from({ length: TEAMS_TABLE_SKELETON_ROWS }, (_, i) => ({
+  id: `__sk-${i}`,
+}))
 const teams = ref<TeamRow[]>([])
 const pageSize = ref(10)
 const first = ref(0)
@@ -37,6 +45,7 @@ const isEdit = computed(() => !!editing.value)
 
 const form = reactive({
   name: '',
+  rating: 3,
   category: '',
   logoUrl: '',
   coachName: '',
@@ -50,8 +59,14 @@ const form = reactive({
 /** Slug в API всегда из названия (как на публичных URL). */
 const teamSlugGenerated = computed(() => slugifyFromTitle(form.name, 'team'))
 
+const showTeamsPaginator = computed(() => totalTeams.value > TEAMS_TABLE_SKELETON_ROWS)
+
 const fetchTeams = async (page: number = 1, size: number = pageSize.value, nameQuery: string = searchQuery.value) => {
-  if (!token.value) return
+  if (!token.value) {
+    loading.value = false
+    return
+  }
+  const loadStartedAt = Date.now()
   loading.value = true
   const pageNum = Math.max(1, Math.floor(Number(page) || 1))
   const pageSizeNum = Math.max(1, Math.floor(Number(size) || pageSize.value || 10))
@@ -72,6 +87,7 @@ const fetchTeams = async (page: number = 1, size: number = pageSize.value, nameQ
     teams.value = res.items
     totalTeams.value = res.total
   } finally {
+    await sleepRemainingAfter(MIN_SKELETON_DISPLAY_MS, loadStartedAt)
     loading.value = false
   }
 }
@@ -135,6 +151,7 @@ watch(searchQuery, (v) => {
 const openCreate = () => {
   editing.value = null
   form.name = ''
+  form.rating = 3
   form.category = ''
   form.logoUrl = ''
   form.coachName = ''
@@ -149,6 +166,7 @@ const openCreate = () => {
 const openEdit = (t: TeamRow) => {
   editing.value = t
   form.name = t.name
+  form.rating = Math.min(5, Math.max(1, Number(t.rating ?? 3)))
   form.category = t.category ?? ''
   form.logoUrl = t.logoUrl ?? ''
   form.coachName = t.coachName ?? ''
@@ -166,6 +184,7 @@ const saveTeam = async () => {
   try {
     const body: any = {
       name: form.name,
+      rating: Math.min(5, Math.max(1, Number(form.rating || 3))),
       slug: teamSlugGenerated.value,
       category: form.category || undefined,
       logoUrl: form.logoUrl || undefined,
@@ -198,27 +217,53 @@ const saveTeam = async () => {
   }
 }
 
-const deleteTeam = async (t: TeamRow) => {
-  if (!token.value) return
-  if (!confirm(`Удалить команду "${t.name}"?`)) return
-  await authFetch(apiUrl(`/tenants/${tenantId.value}/teams/${t.id}`), {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token.value}` },
-  })
-  await fetchTeams(currentPage.value, pageSize.value, searchQuery.value)
+const deleteTeamConfirmOpen = ref(false)
+const teamToDelete = ref<TeamRow | null>(null)
+const deleteTeamMessage = computed(() => {
+  const t = teamToDelete.value
+  if (!t) return ''
+  return `Удалить команду «${t.name}»? Связи с игроками и турнирами будут сняты.`
+})
+
+function requestDeleteTeam(t: TeamRow) {
+  teamToDelete.value = t
+  deleteTeamConfirmOpen.value = true
+}
+
+async function confirmDeleteTeam() {
+  const t = teamToDelete.value
+  if (!token.value || !t) return
+  try {
+    await authFetch(apiUrl(`/tenants/${tenantId.value}/teams/${t.id}`), {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token.value}` },
+    })
+    await fetchTeams(currentPage.value, pageSize.value, searchQuery.value)
+    toast.add({ severity: 'success', summary: 'Команда удалена', life: 2500 })
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: 'Не удалось удалить команду',
+      detail: getApiErrorMessage(err),
+      life: 6000,
+    })
+  } finally {
+    teamToDelete.value = null
+  }
 }
 
 onMounted(() => {
   if (typeof window !== 'undefined') {
     syncWithStorage()
     if (!loggedIn.value) {
+      loading.value = false
       router.push('/admin/login')
       return
     }
   }
   currentPage.value = 1
-  fetchTeamCategories()
-  fetchTeams(1, pageSize.value, searchQuery.value)
+  void fetchTeamCategories()
+  void fetchTeams(1, pageSize.value, searchQuery.value)
 })
 
 const onTeamsPage = (event: any) => {
@@ -254,6 +299,11 @@ const rosterTeam = ref<TeamRow | null>(null)
 const rosterPlayers = ref<TeamPlayerRow[]>([])
 const rosterTotal = ref(0)
 const rosterLoading = ref(false)
+const rosterSkeletonRows = Array.from({ length: TEAMS_TABLE_SKELETON_ROWS }, (_, i) => ({
+  id: `__rsk-${i}`,
+}))
+/** Сбрасываем в finally только если это актуальный запрос (закрытие диалога / новый fetch). */
+let rosterFetchSeq = 0
 
 const rosterPageSize = ref(10)
 const rosterFirst = ref(0)
@@ -324,7 +374,12 @@ watch(
 )
 
 const fetchRosterPlayers = async () => {
-  if (!token.value || !rosterTeam.value) return
+  if (!token.value || !rosterTeam.value) {
+    rosterLoading.value = false
+    return
+  }
+  const seq = ++rosterFetchSeq
+  const loadStartedAt = Date.now()
   rosterLoading.value = true
   const page = Math.max(1, Math.floor(Number(rosterCurrentPage.value) || 1))
   const size = Math.max(1, Math.floor(Number(rosterPageSize.value) || 10))
@@ -360,7 +415,10 @@ const fetchRosterPlayers = async () => {
     rosterPlayers.value = res.items
     rosterTotal.value = res.total
   } finally {
-    rosterLoading.value = false
+    await sleepRemainingAfter(MIN_SKELETON_DISPLAY_MS, loadStartedAt)
+    if (seq === rosterFetchSeq) {
+      rosterLoading.value = false
+    }
   }
 }
 
@@ -398,6 +456,9 @@ const resetRosterFilters = () => {
 const openRoster = async (team: TeamRow) => {
   clearRosterFilterDebounce()
   rosterTeam.value = team
+  rosterLoading.value = true
+  rosterPlayers.value = []
+  rosterTotal.value = 0
   rosterOpen.value = true
   rosterCurrentPage.value = 1
   rosterFirst.value = 0
@@ -411,8 +472,16 @@ const openRoster = async (team: TeamRow) => {
   await nextTick(() => clearRosterFilterDebounce())
 }
 
+watch(rosterOpen, (open) => {
+  if (!open) {
+    rosterFetchSeq += 1
+    rosterLoading.value = false
+  }
+})
+
 const rosterEditorOpen = ref(false)
 const rosterEditorMode = ref<'create' | 'edit'>('create')
+const rosterEditorSaving = ref(false)
 
 const editorPlayerId = ref<string | null>(null)
 const editorJerseyNumber = ref<number | null>(null)
@@ -420,24 +489,52 @@ const editorPosition = ref<string>('')
 
 const editorPickQuery = ref('')
 const editorPickLoading = ref(false)
-const editorPickOptions = ref<Array<{ label: string; value: string }>>([])
+const editorPickPlayers = ref<
+  Array<{
+    id: string
+    firstName: string
+    lastName: string
+    birthDate: string | null
+    team?: { id: string; name: string } | null
+  }>
+>([])
+const editorPickSelected = ref<
+  Array<{
+    id: string
+    firstName: string
+    lastName: string
+    birthDate: string | null
+    team?: { id: string; name: string } | null
+  }>
+>([])
 
 const fetchPickPlayers = async () => {
   if (!token.value || !rosterTeam.value) return
   editorPickLoading.value = true
   try {
-    const res = await authFetch<{ items: Array<{ id: string; firstName: string; lastName: string }>; total: number }>(
+    const res = await authFetch<{
+      items: Array<{
+        id: string
+        firstName: string
+        lastName: string
+        birthDate: string | null
+        team?: { id: string; name: string } | null
+      }>
+      total: number
+    }>(
       apiUrl(`/tenants/${tenantId.value}/players`),
       {
         headers: { Authorization: `Bearer ${token.value}` },
         params: {
           page: 1,
-          pageSize: 50,
-          ...(editorPickQuery.value.trim() ? { lastName: editorPickQuery.value.trim() } : {}),
+          pageSize: 200,
+          ...(editorPickQuery.value.trim() ? { name: editorPickQuery.value.trim() } : {}),
         },
       },
     )
-    editorPickOptions.value = res.items.map((p) => ({ label: `${p.lastName} ${p.firstName}`, value: p.id }))
+    editorPickPlayers.value = res.items.filter((p) => !p.team)
+    const allowed = new Set(editorPickPlayers.value.map((p) => p.id))
+    editorPickSelected.value = editorPickSelected.value.filter((p) => allowed.has(p.id))
   } finally {
     editorPickLoading.value = false
   }
@@ -449,6 +546,8 @@ const openAddRosterPlayer = async () => {
   editorJerseyNumber.value = null
   editorPosition.value = ''
   editorPickQuery.value = ''
+  editorPickSelected.value = []
+  editorPickPlayers.value = []
   await fetchPickPlayers()
   rosterEditorOpen.value = true
 }
@@ -462,45 +561,119 @@ const openEditRosterPlayer = (tp: TeamPlayerRow) => {
 }
 
 const saveRosterPlayer = async () => {
-  if (!token.value || !rosterTeam.value || !editorPlayerId.value) return
-  if (rosterEditorMode.value === 'create') {
-    await authFetch(apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players`), {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token.value}` },
-      body: {
-        playerId: editorPlayerId.value,
-        jerseyNumber: editorJerseyNumber.value ?? undefined,
-        position: editorPosition.value || undefined,
-      },
-    })
-  } else {
-    await authFetch(
-      apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players/${editorPlayerId.value}`),
-      {
-        method: 'PATCH',
+  if (!token.value || !rosterTeam.value) return
+  rosterEditorSaving.value = true
+  try {
+    if (rosterEditorMode.value === 'create') {
+      if (!editorPickSelected.value.length) {
+        toast.add({
+          severity: 'warn',
+          summary: 'Не выбраны игроки',
+          detail: 'Отметьте хотя бы одного игрока в таблице.',
+          life: 3500,
+        })
+        return
+      }
+      const bulkRes = await authFetch<{
+        total: number
+        added: number
+        failed: number
+        results: Array<{ playerId: string; ok: boolean; error?: string }>
+      }>(apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players/bulk`), {
+        method: 'POST',
         headers: { Authorization: `Bearer ${token.value}` },
-        body: {
-          jerseyNumber: editorJerseyNumber.value ?? undefined,
-          position: editorPosition.value || undefined,
+        body: { playerIds: editorPickSelected.value.map((p) => p.id) },
+      })
+      if (bulkRes.failed > 0) {
+        const firstError = bulkRes.results.find((r) => !r.ok)?.error
+        toast.add({
+          severity: bulkRes.added > 0 ? 'warn' : 'error',
+          summary: bulkRes.added > 0 ? 'Добавлены не все игроки' : 'Не удалось добавить игроков',
+          detail: firstError || `Не удалось добавить ${bulkRes.failed} из ${bulkRes.total}.`,
+          life: 7000,
+        })
+      } else {
+        toast.add({
+          severity: 'success',
+          summary: 'Игроки добавлены в команду',
+          detail: `Добавлено: ${bulkRes.added}.`,
+          life: 3000,
+        })
+      }
+    } else {
+      if (!editorPlayerId.value) return
+      await authFetch(
+        apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players/${editorPlayerId.value}`),
+        {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token.value}` },
+          body: {
+            jerseyNumber: editorJerseyNumber.value ?? undefined,
+            position: editorPosition.value || undefined,
+          },
         },
-      },
-    )
+      )
+    }
+    rosterEditorOpen.value = false
+    await fetchRosterPlayers()
+    if (rosterEditorMode.value === 'edit') {
+      toast.add({
+        severity: 'success',
+        summary: 'Игрок обновлен',
+        life: 2500,
+      })
+    }
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary:
+        rosterEditorMode.value === 'create'
+          ? 'Не удалось добавить игрока в команду'
+          : 'Не удалось обновить игрока в команде',
+      detail: getApiErrorMessage(err),
+      life: 7000,
+    })
+  } finally {
+    rosterEditorSaving.value = false
   }
-  rosterEditorOpen.value = false
-  await fetchRosterPlayers()
 }
 
-const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
-  if (!token.value || !rosterTeam.value) return
-  if (!confirm(`Удалить игрока "${tp.player.lastName} ${tp.player.firstName}" из команды?`)) return
-  await authFetch(
-    apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players/${tp.playerId}`),
-    {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token.value}` },
-    },
-  )
-  await fetchRosterPlayers()
+const deleteRosterPlayerConfirmOpen = ref(false)
+const rosterPlayerToDelete = ref<TeamPlayerRow | null>(null)
+const deleteRosterPlayerMessage = computed(() => {
+  const tp = rosterPlayerToDelete.value
+  if (!tp) return ''
+  return `Убрать игрока «${tp.player.lastName} ${tp.player.firstName}» из состава команды?`
+})
+
+function requestDeleteRosterPlayer(tp: TeamPlayerRow) {
+  rosterPlayerToDelete.value = tp
+  deleteRosterPlayerConfirmOpen.value = true
+}
+
+async function confirmDeleteRosterPlayer() {
+  const tp = rosterPlayerToDelete.value
+  if (!token.value || !rosterTeam.value || !tp) return
+  try {
+    await authFetch(
+      apiUrl(`/tenants/${tenantId.value}/teams/${rosterTeam.value.id}/players/${tp.playerId}`),
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token.value}` },
+      },
+    )
+    await fetchRosterPlayers()
+    toast.add({ severity: 'success', summary: 'Игрок убран из состава', life: 2500 })
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: 'Не удалось убрать игрока',
+      detail: getApiErrorMessage(err),
+      life: 6000,
+    })
+  } finally {
+    rosterPlayerToDelete.value = null
+  }
 }
 </script>
 
@@ -511,7 +684,17 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
         <h1 class="text-xl font-semibold text-surface-900">Команды</h1>
         <p class="mt-1 text-sm text-muted-color">Справочник команд тенанта.</p>
       </div>
-      <Button label="Создать" icon="pi pi-plus" @click="openCreate" />
+      <div class="flex flex-wrap items-center gap-2">
+        <Button
+          label="Обновить"
+          icon="pi pi-refresh"
+          text
+          severity="secondary"
+          :loading="loading"
+          @click="fetchTeams(currentPage, pageSize, searchQuery)"
+        />
+        <Button label="Создать" icon="pi pi-plus" @click="openCreate" />
+      </div>
     </header>
 
     <div class="flex items-center gap-3">
@@ -531,41 +714,101 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
     </div>
 
     <DataTable
+      v-if="loading"
+      :value="skeletonTeamRows"
+      striped-rows
+      data-key="id"
+      class="min-h-[28rem]"
+      aria-busy="true"
+    >
+      <Column header="" style="width: 5.5rem">
+        <template #body>
+          <Skeleton width="2.5rem" height="2.5rem" class="rounded" />
+        </template>
+      </Column>
+      <Column header="Название">
+        <template #body>
+          <Skeleton width="70%" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Рейтинг" style="width: 7rem">
+        <template #body>
+          <Skeleton width="2rem" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Категория">
+        <template #body>
+          <Skeleton width="45%" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Игроков">
+        <template #body>
+          <Skeleton width="2rem" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Действия" style="width: 16rem">
+        <template #body>
+          <div class="flex justify-end gap-2">
+            <Skeleton shape="circle" width="2rem" height="2rem" />
+            <Skeleton shape="circle" width="2rem" height="2rem" />
+            <Skeleton shape="circle" width="2rem" height="2rem" />
+          </div>
+        </template>
+      </Column>
+    </DataTable>
+
+    <DataTable
+      v-else
       :value="teams"
-      :loading="loading"
-      stripedRows
-      paginator
+      striped-rows
+      :paginator="showTeamsPaginator"
       lazy
-      :totalRecords="totalTeams"
+      :total-records="totalTeams"
       :first="first"
       :rows="pageSize"
-      :rowsPerPageOptions="[5, 10, 20, 50]"
+      :rows-per-page-options="[5, 10, 20, 50]"
+      paginator-template="FirstPageLink PrevPageLink PageLinks NextPageLink LastPageLink RowsPerPageDropdown"
+      current-page-report-template="{first}–{last} из {totalRecords}"
       @page="onTeamsPage"
       @sort="onTeamsSort"
     >
+      <template #empty>
+        <div
+          class="flex flex-col items-center justify-center gap-2 py-14 text-muted-color"
+        >
+          <i class="pi pi-shield text-4xl opacity-40" aria-hidden="true" />
+          <span class="text-sm font-medium text-surface-700 dark:text-surface-200">Нет команд</span>
+          <span class="max-w-sm text-center text-xs">
+            По заданным условиям записей нет. Измените поиск или создайте команду кнопкой «Создать».
+          </span>
+        </div>
+      </template>
       <Column header="" style="width: 5.5rem">
         <template #body="{ data }">
           <img
             v-if="data.logoUrl"
             :src="data.logoUrl"
             alt="Логотип"
-            class="w-10 h-10 object-cover border border-surface-200 rounded bg-surface-0"
+            class="h-10 w-10 rounded object-cover"
           />
           <div
             v-else
-            class="w-10 h-10 border border-surface-200 rounded bg-surface-0 p-1"
+            class="h-10 w-10 rounded border border-surface-200 bg-surface-0 p-1"
             aria-label="Нет логотипа"
           />
         </template>
       </Column>
       <Column field="name" header="Название" sortable />
+      <Column field="rating" header="Рейтинг" sortable style="width: 7rem">
+        <template #body="{ data }">{{ data.rating ?? 3 }}</template>
+      </Column>
       <Column field="category" header="Категория" />
       <Column field="playersCount" header="Игроков" sortable>
         <template #body="{ data }">{{ data.playersCount }}</template>
       </Column>
       <Column header="Действия" style="width: 16rem">
         <template #body="{ data }">
-          <div class="flex gap-2 justify-end w-full">
+          <div class="flex w-full justify-end gap-2">
             <Button
               icon="pi pi-pencil"
               text
@@ -585,13 +828,28 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
               text
               severity="danger"
               size="small"
-              @click="deleteTeam(data)"
+              @click="requestDeleteTeam(data)"
               aria-label="Удалить"
             />
           </div>
         </template>
       </Column>
     </DataTable>
+
+    <AdminConfirmDialog
+      v-model="deleteTeamConfirmOpen"
+      title="Удалить команду?"
+      :message="deleteTeamMessage"
+      @confirm="confirmDeleteTeam"
+    />
+
+    <AdminConfirmDialog
+      v-model="deleteRosterPlayerConfirmOpen"
+      title="Убрать из состава?"
+      :message="deleteRosterPlayerMessage"
+      confirm-label="Убрать"
+      @confirm="confirmDeleteRosterPlayer"
+    />
 
     <Dialog
       :visible="showForm"
@@ -602,14 +860,17 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
       :contentStyle="{ paddingTop: '1.75rem' }"
     >
       <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <!-- Left: placeholder for team picture -->
-        <div class="md:col-span-1 flex items-stretch relative">
+        <!-- Left: квадратный логотип -->
+        <div class="md:col-span-1 flex items-start justify-center md:justify-stretch relative">
           <button
             type="button"
-            class="w-full h-full min-h-28 overflow-hidden rounded-xl border border-surface-200 bg-surface-0 flex items-center justify-center relative leading-none"
-            :class="
-              logoUploading || logoRemoving ? 'cursor-wait opacity-80' : 'cursor-pointer'
-            "
+            class="w-full aspect-square overflow-hidden rounded-xl bg-surface-0 flex items-center justify-center relative leading-none"
+            :class="[
+              logoUploading || logoRemoving ? 'cursor-wait opacity-80' : 'cursor-pointer',
+              form.logoUrl && !logoUploading && !logoRemoving
+                ? 'border-0'
+                : 'border border-surface-200',
+            ]"
             :disabled="logoUploading || logoRemoving"
             @click="triggerLogoPick"
             aria-label="Загрузить или заменить логотип команды"
@@ -655,22 +916,45 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
             class="hidden"
             @change="onLogoFileChange"
           />
+
         </div>
 
-        <!-- Right: fields -->
+        <!-- Справа от логотипа: название, slug, тренер, рейтинг -->
         <div class="space-y-4 md:col-span-2">
           <FloatLabel variant="on" class="block">
             <InputText id="team_name" v-model="form.name" class="w-full" />
             <label for="team_name">Название</label>
           </FloatLabel>
 
-          <p class="text-xs text-muted-color">
-            Slug в URL формируется автоматически:
-            <code class="ml-1 rounded bg-surface-100 px-1.5 py-0.5 font-mono text-surface-800">{{
-              teamSlugGenerated
-            }}</code>
-          </p>
+          <FloatLabel variant="on" class="block">
+            <InputText
+              id="team_slug"
+              :modelValue="teamSlugGenerated"
+              class="w-full"
+              readonly
+              disabled
+            />
+            <label for="team_slug">Slug (авто)</label>
+          </FloatLabel>
 
+          <FloatLabel variant="on" class="block">
+            <InputText id="team_coach" v-model="form.coachName" class="w-full" />
+            <label for="team_coach">Тренер (имя)</label>
+          </FloatLabel>
+
+          <FloatLabel variant="on" class="block">
+            <InputNumber
+              inputId="team_rating"
+              v-model="form.rating"
+              class="w-full"
+              :min="1"
+              :max="5"
+            />
+            <label for="team_rating">Рейтинг (1-5)</label>
+          </FloatLabel>
+        </div>
+
+        <div class="md:col-span-3">
           <FloatLabel variant="on" class="block">
             <Select
               inputId="team_cat"
@@ -682,11 +966,6 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
               :loading="categoriesLoading"
             />
             <label for="team_cat">Категория</label>
-          </FloatLabel>
-
-          <FloatLabel variant="on" class="block">
-            <InputText id="team_coach" v-model="form.coachName" class="w-full" />
-            <label for="team_coach">Тренер (имя)</label>
           </FloatLabel>
         </div>
 
@@ -756,18 +1035,68 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
         </div>
 
         <DataTable
+          v-if="rosterLoading"
+          :value="rosterSkeletonRows"
+          striped-rows
+          data-key="id"
+          class="min-h-[24rem]"
+          responsive-layout="scroll"
+          aria-busy="true"
+        >
+          <Column header="№" style="width: 5rem">
+            <template #body>
+              <Skeleton width="1.75rem" height="1rem" class="rounded-md" />
+            </template>
+          </Column>
+          <Column header="Игрок" style="min-width: 14rem">
+            <template #body>
+              <div class="flex items-center gap-3">
+                <Skeleton width="2.5rem" height="2.5rem" class="rounded-lg" />
+                <div class="min-w-0 flex-1 space-y-2">
+                  <Skeleton width="75%" height="0.875rem" class="rounded-md" />
+                  <Skeleton width="45%" height="0.75rem" class="rounded-md" />
+                </div>
+              </div>
+            </template>
+          </Column>
+          <Column header="Дата рождения" style="min-width: 9rem">
+            <template #body>
+              <Skeleton width="5.5rem" height="1rem" class="rounded-md" />
+            </template>
+          </Column>
+          <Column header="Амплуа" style="min-width: 8rem">
+            <template #body>
+              <Skeleton width="4rem" height="1rem" class="rounded-md" />
+            </template>
+          </Column>
+          <Column header="Телефон" style="min-width: 10rem">
+            <template #body>
+              <Skeleton width="70%" height="1rem" class="rounded-md" />
+            </template>
+          </Column>
+          <Column header="Действия" style="width: 8rem">
+            <template #body>
+              <div class="flex justify-end gap-2">
+                <Skeleton shape="circle" width="2rem" height="2rem" />
+                <Skeleton shape="circle" width="2rem" height="2rem" />
+              </div>
+            </template>
+          </Column>
+        </DataTable>
+
+        <DataTable
+          v-else
           :value="rosterPlayers"
-          :loading="rosterLoading"
-          stripedRows
+          striped-rows
           :paginator="rosterTotal >= 6"
           lazy
-          v-model:sortField="rosterSortField"
-          v-model:sortOrder="rosterSortOrder"
-          :totalRecords="rosterTotal"
+          v-model:sort-field="rosterSortField"
+          v-model:sort-order="rosterSortOrder"
+          :total-records="rosterTotal"
           :first="rosterFirst"
           :rows="rosterPageSize"
-          :rowsPerPageOptions="[5, 10, 20, 50]"
-          responsiveLayout="scroll"
+          :rows-per-page-options="[5, 10, 20, 50]"
+          responsive-layout="scroll"
           @page="onRosterPage"
           @sort="onRosterSort"
         >
@@ -806,7 +1135,7 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
                   v-if="data.player.photoUrl"
                   :src="data.player.photoUrl"
                   :alt="`${data.player.firstName} ${data.player.lastName}`"
-                  class="h-10 w-10 shrink-0 rounded-lg border border-surface-200 bg-surface-0 object-cover"
+                  class="h-10 w-10 shrink-0 rounded-lg object-cover"
                 />
                 <div
                   v-else
@@ -849,7 +1178,7 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
             <template #body="{ data }">
               <div class="flex w-full justify-end gap-2">
                 <Button icon="pi pi-pencil" text size="small" @click="openEditRosterPlayer(data)" aria-label="Редактировать" />
-                <Button icon="pi pi-trash" text severity="danger" size="small" @click="deleteRosterPlayer(data)" aria-label="Удалить" />
+                <Button icon="pi pi-trash" text severity="danger" size="small" @click="requestDeleteRosterPlayer(data)" aria-label="Удалить" />
               </div>
             </template>
           </Column>
@@ -869,7 +1198,7 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div v-if="rosterEditorMode === 'create'">
             <FloatLabel variant="on" class="block">
-              <InputText v-model="editorPickQuery" class="w-full" placeholder="Поиск игрока по фамилии" />
+              <InputText v-model="editorPickQuery" class="w-full" placeholder="Поиск игрока по имени/фамилии" />
               <label>Поиск</label>
             </FloatLabel>
             <Button
@@ -881,24 +1210,41 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
             />
           </div>
 
-          <FloatLabel variant="on" class="block md:col-span-2" v-if="rosterEditorMode === 'create'">
-            <Select
-              v-model="editorPlayerId"
-              :options="editorPickOptions"
-              option-label="label"
-              option-value="value"
-              class="w-full"
-              placeholder="Выберите игрока"
-            />
-            <label>Игрок</label>
-          </FloatLabel>
+          <div v-if="rosterEditorMode === 'create'" class="md:col-span-2">
+            <DataTable
+              :value="editorPickPlayers"
+              v-model:selection="editorPickSelected"
+              dataKey="id"
+              selectionMode="multiple"
+              :loading="editorPickLoading"
+              size="small"
+              scrollable
+              scrollHeight="280px"
+              class="rounded-lg border border-surface-200 dark:border-surface-700"
+            >
+              <Column selectionMode="multiple" headerStyle="width: 3rem" />
+              <Column field="lastName" header="Фамилия" />
+              <Column field="firstName" header="Имя" />
+              <Column header="Дата рождения">
+                <template #body="{ data }">
+                  <span v-if="data.birthDate">{{ new Date(data.birthDate).toLocaleDateString() }}</span>
+                  <span v-else class="text-muted-color">—</span>
+                </template>
+              </Column>
+              <template #empty>
+                <div class="py-6 text-center text-sm text-muted-color">
+                  Нет игроков без команды по текущему поиску
+                </div>
+              </template>
+            </DataTable>
+          </div>
 
-          <FloatLabel variant="on" class="block">
+          <FloatLabel variant="on" class="block" v-if="rosterEditorMode === 'edit'">
             <InputNumber v-model="editorJerseyNumber" class="w-full" placeholder="№" :min="0" />
             <label>Номер игрока</label>
           </FloatLabel>
 
-          <FloatLabel variant="on" class="block">
+          <FloatLabel variant="on" class="block" v-if="rosterEditorMode === 'edit'">
             <Select
               v-model="editorPosition"
               :options="positionOptions"
@@ -918,7 +1264,7 @@ const deleteRosterPlayer = async (tp: TeamPlayerRow) => {
           <Button
             :label="rosterEditorMode === 'edit' ? 'Сохранить' : 'Добавить'"
             icon="pi pi-check"
-            :loading="saving"
+            :loading="rosterEditorSaving"
             @click="saveRosterPlayer"
           />
         </div>

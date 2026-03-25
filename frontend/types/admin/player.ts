@@ -9,6 +9,7 @@ export interface PlayerRow {
   firstName: string
   lastName: string
   birthDate: string | null
+  gender: 'MALE' | 'FEMALE' | null
   position: string | null
   phone: string | null
   bioNumber: string | null

@@ -1,7 +1,7 @@
-/** Один пункт-ссылка в меню */
+/** Один пункт-ссылка в меню (подписи через i18n: `labelKey`) */
 export interface AdminNavLinkItem {
   to: string
-  label: string
+  labelKey: string
   icon: string
   exact?: boolean
 }
@@ -9,7 +9,7 @@ export interface AdminNavLinkItem {
 /** Группа с подпунктами */
 export interface AdminNavSection {
   id: string
-  label: string
+  labelKey: string
   icon: string
   items: AdminNavLinkItem[]
 }
@@ -42,25 +42,58 @@ export function findActiveAdminNavSectionId(path: string): string | null {
  * Структура бокового меню: сначала корневые ссылки, затем группы с подпунктами.
  */
 export const ADMIN_NAV_ENTRIES: AdminNavEntry[] = [
-  { to: '/admin', label: 'Дашборд', icon: 'pi pi-home', exact: true },
+  { to: '/admin', labelKey: 'admin.nav.dashboard', icon: 'pi pi-home', exact: true },
+  { to: '/admin/users', labelKey: 'admin.nav.users', icon: 'pi pi-user' },
   {
     id: 'people',
-    label: 'Участники и команды',
+    labelKey: 'admin.nav.group_people',
     icon: 'pi pi-users',
     items: [
-      { to: '/admin/users', label: 'Пользователи', icon: 'pi pi-user' },
-      { to: '/admin/teams', label: 'Команды', icon: 'pi pi-shield' },
-      { to: '/admin/players', label: 'Игроки', icon: 'pi pi-id-card' },
-      { to: '/admin/team-categories', label: 'Категории команд', icon: 'pi pi-tags' },
+      { to: '/admin/teams', labelKey: 'admin.nav.teams', icon: 'pi pi-shield' },
+      { to: '/admin/players', labelKey: 'admin.nav.players', icon: 'pi pi-id-card' },
+    ],
+  },
+  {
+    id: 'references',
+    labelKey: 'admin.nav.group_references',
+    icon: 'pi pi-book',
+    items: [
+      { to: '/admin/team-categories', labelKey: 'admin.nav.categories', icon: 'pi pi-tags' },
+      {
+        to: '/admin/references/competitions',
+        labelKey: 'admin.nav.ref_competitions',
+        icon: 'pi pi-flag',
+      },
+      { to: '/admin/references/seasons', labelKey: 'admin.nav.seasons', icon: 'pi pi-calendar' },
+      { to: '/admin/references/documents', labelKey: 'admin.nav.documents', icon: 'pi pi-file' },
+      { to: '/admin/references/referees', labelKey: 'admin.nav.referees', icon: 'pi pi-user' },
+      {
+        to: '/admin/references/referee-categories',
+        labelKey: 'admin.nav.referee_categories',
+        icon: 'pi pi-bookmark',
+      },
+      {
+        to: '/admin/references/referee-positions',
+        labelKey: 'admin.nav.referee_positions',
+        icon: 'pi pi-briefcase',
+      },
+      { to: '/admin/references/stadiums', labelKey: 'admin.nav.stadiums', icon: 'pi pi-building' },
+      {
+        to: '/admin/references/management',
+        labelKey: 'admin.nav.management',
+        icon: 'pi pi-users',
+      },
     ],
   },
   {
     id: 'competitions',
-    label: 'Соревнования',
+    labelKey: 'admin.nav.group_tournaments',
     icon: 'pi pi-trophy',
     items: [
-      { to: '/admin/tournaments', label: 'Турниры', icon: 'pi pi-sitemap' },
-      { to: '/admin/matches', label: 'Матчи', icon: 'pi pi-calendar' },
+      { to: '/admin/tournaments', labelKey: 'admin.nav.tournaments', icon: 'pi pi-sitemap' },
+      { to: '/admin/matches', labelKey: 'admin.nav.matches', icon: 'pi pi-calendar' },
+      { to: '/admin/calendar', labelKey: 'admin.nav.calendar', icon: 'pi pi-calendar-clock' },
     ],
   },
+  { to: '/admin/settings', labelKey: 'admin.nav.settings', icon: 'pi pi-cog' },
 ]

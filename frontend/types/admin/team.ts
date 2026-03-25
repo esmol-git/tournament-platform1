@@ -3,6 +3,7 @@ export interface TeamRow {
   id: string
   name: string
   slug: string | null
+  rating?: number | null
   category: string | null
   logoUrl: string | null
   coachName: string | null

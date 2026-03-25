@@ -4,6 +4,7 @@ import { useAdminLogout } from '~/composables/useAdminLogout'
 const visible = defineModel<boolean>({ default: false })
 
 const { logout } = useAdminLogout()
+const { t } = useI18n()
 
 const onConfirm = async () => {
   visible.value = false
@@ -15,22 +16,22 @@ const onConfirm = async () => {
   <Dialog
     :visible="visible"
     modal
-    header="Подтверждение выхода"
+    :header="t('admin.logout.title')"
     :style="{ width: '24rem' }"
     @update:visible="(v) => (visible = v)"
   >
     <p class="mb-4 text-sm text-muted-color">
-      Вы уверены, что хотите выйти из админ‑панели?
+      {{ t('admin.logout.message') }}
     </p>
     <div class="flex justify-end gap-2">
       <Button
-        label="Отмена"
+        :label="t('admin.logout.cancel')"
         text
         class="px-3 py-2"
         @click="visible = false"
       />
       <Button
-        label="Выйти"
+        :label="t('admin.logout.confirm')"
         severity="danger"
         class="px-3 py-2"
         @click="onConfirm"

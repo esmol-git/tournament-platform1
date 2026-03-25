@@ -1,18 +1,25 @@
 <script setup lang="ts">
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useAuth } from '~/composables/useAuth'
 import { useApiUrl } from '~/composables/useApiUrl'
 import { USER_ROLE_LABELS_RU, userRoleLabelRu } from '~/constants/userRoles'
 import { useMetaStore } from '~/stores/meta'
 import type { UserRow } from '~/types/admin/user'
+import { getApiErrorMessage } from '~/utils/apiError'
+import { MIN_SKELETON_DISPLAY_MS, sleepRemainingAfter } from '~/utils/minimumLoadingDelay'
 
 definePageMeta({
   layout: 'admin',
 })
 
 const router = useRouter()
-const { token, syncWithStorage, loggedIn, authFetch, fetchMe } = useAuth()
+const { token, user, syncWithStorage, loggedIn, authFetch, fetchMe } = useAuth()
 const { apiUrl } = useApiUrl()
+const toast = useToast()
 const metaStore = useMetaStore()
+
+/** Роли, которые может назначать только платформа / не через админку тенанта. */
+const ELEVATED_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN'])
 
 const roleOptionsRu = computed(() =>
   metaStore.roles.map((r) => ({
@@ -21,7 +28,27 @@ const roleOptionsRu = computed(() =>
   })),
 )
 
-const loading = ref(false)
+/** Для админа тенанта — без супер-админа и «Администратора»; текущую роль при редактировании оставляем в списке. */
+const formRoleOptionsRu = computed(() => {
+  const me = (user.value as { role?: string } | null)?.role
+  if (me !== 'TENANT_ADMIN') return roleOptionsRu.value
+  const editingRole = editingUser.value?.role
+  return roleOptionsRu.value.filter((o) => {
+    if (!ELEVATED_ROLES.has(o.value)) return true
+    return isEdit.value && editingRole === o.value
+  })
+})
+
+/** Фильтр по роли над таблицей: для админа тенанта без SUPER_ADMIN. */
+const filterRoleOptionsRu = computed(() => {
+  const me = (user.value as { role?: string } | null)?.role
+  const base = [{ label: 'Все роли', value: '' }, ...roleOptionsRu.value]
+  if (me !== 'TENANT_ADMIN') return base
+  return base.filter((o) => o.value !== 'SUPER_ADMIN')
+})
+
+/** До ответа API — иначе при полной перезагрузке один кадр «Нет пользователей». */
+const loading = ref(true)
 const users = ref<UserRow[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -33,6 +60,7 @@ const showForm = ref(false)
 const editingUser = ref<UserRow | null>(null)
 
 const form = reactive({
+  username: '',
   email: '',
   name: '',
   lastName: '',
@@ -43,7 +71,11 @@ const form = reactive({
 const isEdit = computed(() => !!editingUser.value)
 
 const fetchUsers = async () => {
-  if (!token.value) return
+  if (!token.value) {
+    loading.value = false
+    return
+  }
+  const loadStartedAt = Date.now()
   loading.value = true
   try {
     const res = await authFetch<{
@@ -63,6 +95,7 @@ const fetchUsers = async () => {
     users.value = res.items
     total.value = res.total
   } finally {
+    await sleepRemainingAfter(MIN_SKELETON_DISPLAY_MS, loadStartedAt)
     loading.value = false
   }
 }
@@ -70,6 +103,7 @@ const fetchUsers = async () => {
 const openCreate = () => {
   editingUser.value = null
   form.email = ''
+  form.username = ''
   form.name = ''
   form.lastName = ''
   form.password = ''
@@ -80,6 +114,7 @@ const openCreate = () => {
 const openEdit = (user: UserRow) => {
   editingUser.value = user
   form.email = user.email
+  form.username = user.username
   form.name = user.name
   form.lastName = user.lastName ?? ''
   form.password = ''
@@ -90,6 +125,7 @@ const openEdit = (user: UserRow) => {
 const saveUser = async () => {
   if (!token.value) return
   const body: any = {
+    username: form.username,
     name: form.name,
     lastName: form.lastName.trim(),
     role: form.role,
@@ -118,14 +154,39 @@ const saveUser = async () => {
   await fetchUsers()
 }
 
-const deleteUser = async (user: UserRow) => {
-  if (!token.value) return
-  if (!confirm(`Удалить пользователя ${user.email}?`)) return
+const deleteUserConfirmOpen = ref(false)
+const deleteUserPending = ref<UserRow | null>(null)
 
-  await authFetch(apiUrl(`/users/${user.id}`), {
-    method: 'DELETE',
-  })
-  await fetchUsers()
+const deleteUserMessage = computed(() => {
+  const u = deleteUserPending.value
+  if (!u) return ''
+  return `Удалить пользователя ${u.email}? Действие необратимо.`
+})
+
+function requestDeleteUser(user: UserRow) {
+  deleteUserPending.value = user
+  deleteUserConfirmOpen.value = true
+}
+
+async function confirmDeleteUser() {
+  const u = deleteUserPending.value
+  if (!token.value || !u) return
+  try {
+    await authFetch(apiUrl(`/users/${u.id}`), {
+      method: 'DELETE',
+    })
+    await fetchUsers()
+    toast.add({ severity: 'success', summary: 'Пользователь удалён', life: 2500 })
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: 'Не удалось удалить',
+      detail: getApiErrorMessage(err),
+      life: 6000,
+    })
+  } finally {
+    deleteUserPending.value = null
+  }
 }
 
 const toggleBlock = async (user: UserRow) => {
@@ -137,6 +198,13 @@ const toggleBlock = async (user: UserRow) => {
   })
   await fetchUsers()
 }
+
+watch(filterRoleOptionsRu, (opts) => {
+  const allowed = new Set(opts.map((o) => o.value))
+  if (role.value && !allowed.has(role.value)) {
+    role.value = ''
+  }
+})
 
 watch([page, pageSize, role], () => {
   fetchUsers()
@@ -173,6 +241,7 @@ onMounted(() => {
   if (process.client) {
     syncWithStorage()
     if (!loggedIn.value) {
+      loading.value = false
       router.push('/admin/login')
       return
     }
@@ -199,7 +268,17 @@ onMounted(() => {
           Список пользователей текущего тенанта.
         </p>
       </div>
-      <Button label="Создать" icon="pi pi-plus" @click="openCreate" />
+      <div class="flex flex-wrap items-center gap-2">
+        <Button
+          label="Обновить"
+          icon="pi pi-refresh"
+          text
+          severity="secondary"
+          :loading="loading"
+          @click="fetchUsers()"
+        />
+        <Button label="Создать" icon="pi pi-plus" @click="openCreate" />
+      </div>
     </header>
 
     <div class="flex flex-wrap items-center gap-3">
@@ -207,14 +286,14 @@ onMounted(() => {
         <InputIcon class="pi pi-search" />
         <InputText
           v-model="search"
-          placeholder="Поиск по email, имени или фамилии"
+          placeholder="Поиск по логину, email, имени или фамилии"
           class="w-full"
         />
       </IconField>
 
       <Select
         v-model="role"
-        :options="[{ label: 'Все роли', value: '' }, ...roleOptionsRu]"
+        :options="filterRoleOptionsRu"
         option-label="label"
         option-value="value"
         class="w-52"
@@ -271,6 +350,7 @@ onMounted(() => {
         </template>
       </Column>
       <Column field="email" header="Email" />
+      <Column field="username" header="Логин" />
       <Column header="Роль" style="min-width: 10rem">
         <template #body="{ data }">
           {{ userRoleLabelRu(data.role) }}
@@ -317,12 +397,19 @@ onMounted(() => {
               class="!shrink-0 !p-1"
               size="small"
               aria-label="Удалить"
-              @click="deleteUser(data)"
+              @click="requestDeleteUser(data)"
             />
           </div>
         </template>
       </Column>
     </DataTable>
+
+    <AdminConfirmDialog
+      v-model="deleteUserConfirmOpen"
+      title="Удалить пользователя?"
+      :message="deleteUserMessage"
+      @confirm="confirmDeleteUser"
+    />
 
     <Dialog
       v-model:visible="showForm"
@@ -331,6 +418,10 @@ onMounted(() => {
       :style="{ width: '28rem' }"
     >
       <div class="flex flex-col gap-3">
+        <div>
+          <label class="text-sm block mb-1">Логин</label>
+          <InputText v-model="form.username" class="w-full" />
+        </div>
         <div>
           <label class="text-sm block mb-1">Email</label>
           <InputText v-model="form.email" class="w-full" :disabled="isEdit" />
@@ -349,6 +440,7 @@ onMounted(() => {
           </label>
           <Password
             v-model="form.password"
+            class="block w-full"
             input-class="w-full"
             toggleMask
             :feedback="false"
@@ -358,7 +450,7 @@ onMounted(() => {
           <label class="text-sm block mb-1">Роль</label>
           <Select
             v-model="form.role"
-            :options="roleOptionsRu"
+            :options="formRoleOptionsRu"
             option-label="label"
             option-value="value"
             class="w-full"

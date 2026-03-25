@@ -1,6 +1,6 @@
 /** Типы страницы списка/редактирования турниров (`/admin/tournaments`) */
 
-export type TournamentStatus = 'DRAFT' | 'ACTIVE' | 'ARCHIVED'
+export type TournamentStatus = 'DRAFT' | 'ACTIVE' | 'COMPLETED' | 'ARCHIVED'
 
 export type TournamentFormat =
   | 'SINGLE_GROUP'
@@ -9,11 +9,13 @@ export type TournamentFormat =
   | 'GROUPS_4'
   | 'PLAYOFF'
   | 'GROUPS_PLUS_PLAYOFF'
+  | 'MANUAL'
 
 export interface TournamentRow {
   id: string
   name: string
   slug: string
+  category?: string | null
   format: TournamentFormat
   startsAt: string | null
   endsAt: string | null
@@ -22,12 +24,20 @@ export interface TournamentRow {
   logoUrl?: string | null
 }
 
+export interface TournamentListResponse {
+  items: TournamentRow[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 /** Ответ `GET /tournaments/:id` для формы редактирования со списка */
 export interface TournamentDetails {
   id: string
   name: string
   slug: string
   description?: string | null
+  category?: string | null
   logoUrl?: string | null
   format: TournamentFormat
   groupCount?: number

@@ -1,10 +1,22 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { usePublicTenantContext } from '~/composables/usePublicTenantContext'
 
 const route = useRoute()
-const tenant = computed(() => route.params.tenant as string)
+const router = useRouter()
+
+const { tenantSlug, ensureTenantResolved, tenantNotFound } = usePublicTenantContext()
+const tenant = tenantSlug
 const matchId = computed(() => route.params.id as string)
+
+onMounted(async () => {
+  await ensureTenantResolved()
+  if (tenantNotFound.value) return
+  if (String(route.params.tenant ?? '') !== tenant.value) {
+    await router.replace({ params: { tenant: tenant.value }, query: route.query })
+  }
+})
 </script>
 
 <template>

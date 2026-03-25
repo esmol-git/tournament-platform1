@@ -1,20 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { useApiUrl } from '~/composables/useApiUrl'
-import { useAuth } from '~/composables/useAuth'
+import { computed, ref, watch } from 'vue'
 
 import type { TableRow, TournamentDetails, MatchRow } from '~/types/tournament-admin'
+import { usePublicTournamentFetch } from '~/composables/usePublicTournamentFetch'
+import { usePublicTenantContext } from '~/composables/usePublicTenantContext'
 
 const props = defineProps<{
   tournamentId: string
+  /** Если задан — только эта группа (матчи группового этапа), отдельная шахматка. */
+  groupId?: string | null
 }>()
 
-const { apiUrl } = useApiUrl()
-const { token, syncWithStorage, authFetch } = useAuth()
+const { tenantSlug, ensureTenantResolved, tenantNotFound } = usePublicTenantContext()
+const tenant = tenantSlug
+const { fetchTable, fetchTournamentDetail } = usePublicTournamentFetch()
 
 const loading = ref(false)
 const errorText = ref('')
-const authRequired = ref(false)
 
 const tableRows = ref<TableRow[]>([])
 const matches = ref<MatchRow[]>([])
@@ -26,9 +28,18 @@ const teamsInOrder = computed(() => {
     .map((r) => ({ id: r.teamId, name: r.teamName, position: r.position }))
 })
 
+const groupMatches = computed(() => {
+  const all = matches.value ?? []
+  return all.filter((m) => {
+    if (m.stage === 'PLAYOFF') return false
+    if (props.groupId) return m.groupId === props.groupId
+    return true
+  })
+})
+
 const cellTextByKey = computed(() => {
   const grid: Record<string, string> = {}
-  const played = (matches.value ?? []).filter((m) => m.homeScore != null && m.awayScore != null)
+  const played = groupMatches.value.filter((m) => m.homeScore != null && m.awayScore != null)
 
   const push = (rowId: string, colId: string, text: string) => {
     const key = `${rowId}|${colId}`
@@ -57,32 +68,21 @@ const load = async () => {
   matches.value = []
 
   if (!props.tournamentId) return
-
-  if (!token.value) {
-    authRequired.value = true
+  await ensureTenantResolved()
+  if (tenantNotFound.value) {
+    errorText.value = 'Тенант не найден. Проверьте ссылку.'
     return
   }
-
-  authRequired.value = false
   loading.value = true
   try {
     const [table, details] = await Promise.all([
-      authFetch<TableRow[]>(apiUrl(`/tournaments/${props.tournamentId}/table`), {
-        headers: { Authorization: `Bearer ${token.value}` },
-      }),
-      authFetch<TournamentDetails>(apiUrl(`/tournaments/${props.tournamentId}`), {
-        headers: { Authorization: `Bearer ${token.value}` },
-      }),
+      fetchTable(tenant.value, props.tournamentId, props.groupId ?? undefined),
+      fetchTournamentDetail(tenant.value, props.tournamentId),
     ])
 
     tableRows.value = table
     matches.value = details.matches ?? []
   } catch (e: any) {
-    const status = e?.response?.status ?? e?.statusCode
-    if (status === 401) {
-      authRequired.value = true
-      return
-    }
     errorText.value = 'Не удалось загрузить шахматку.'
   } finally {
     loading.value = false
@@ -90,16 +90,12 @@ const load = async () => {
 }
 
 watch(
-  () => props.tournamentId,
+  () => [props.tournamentId, props.groupId] as const,
   () => {
     void load()
   },
   { immediate: true },
 )
-
-onMounted(() => {
-  if (process.client) syncWithStorage()
-})
 </script>
 
 <template>
@@ -113,10 +109,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <div v-if="authRequired" class="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-900">
-      Для просмотра нужна авторизация.
-    </div>
-    <div v-else-if="errorText" class="mt-4 rounded-xl border border-red-300 bg-red-50 p-4 text-red-900">
+    <div v-if="errorText" class="mt-4 rounded-xl border border-red-300 bg-red-50 p-4 text-red-900">
       {{ errorText }}
     </div>
 

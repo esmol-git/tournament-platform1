@@ -1,0 +1,112 @@
+html[data-accent='emerald'] {
+  --p-primary-50: #ecfdf5;
+  --p-primary-100: #d1fae5;
+  --p-primary-200: #a7f3d0;
+  --p-primary-300: #6ee7b7;
+  --p-primary-400: #34d399;
+  --p-primary-500: #10b981;
+  --p-primary-600: #059669;
+  --p-primary-700: #047857;
+  --p-primary-800: #065f46;
+  --p-primary-900: #064e3b;
+  --p-primary-950: #022c22;
+  --p-primary-color: #10b981;
+  --p-primary-hover-color: #059669;
+  --p-primary-active-color: #047857;
+  --p-primary-contrast-color: #ffffff;
+}
+
+html[data-accent='blue'] {
+  --p-primary-50: #eff6ff;
+  --p-primary-100: #dbeafe;
+  --p-primary-200: #bfdbfe;
+  --p-primary-300: #93c5fd;
+  --p-primary-400: #60a5fa;
+  --p-primary-500: #3b82f6;
+  --p-primary-600: #2563eb;
+  --p-primary-700: #1d4ed8;
+  --p-primary-800: #1e40af;
+  --p-primary-900: #1e3a8a;
+  --p-primary-950: #172554;
+  --p-primary-color: #3b82f6;
+  --p-primary-hover-color: #2563eb;
+  --p-primary-active-color: #1d4ed8;
+  --p-primary-contrast-color: #ffffff;
+}
+
+html[data-accent='violet'] {
+  --p-primary-50: #f5f3ff;
+  --p-primary-100: #ede9fe;
+  --p-primary-200: #ddd6fe;
+  --p-primary-300: #c4b5fd;
+  --p-primary-400: #a78bfa;
+  --p-primary-500: #8b5cf6;
+  --p-primary-600: #7c3aed;
+  --p-primary-700: #6d28d9;
+  --p-primary-800: #5b21b6;
+  --p-primary-900: #4c1d95;
+  --p-primary-950: #2e1065;
+  --p-primary-color: #8b5cf6;
+  --p-primary-hover-color: #7c3aed;
+  --p-primary-active-color: #6d28d9;
+  --p-primary-contrast-color: #ffffff;
+}
+
+html[data-accent='rose'] {
+  --p-primary-50: #fff1f2;
+  --p-primary-100: #ffe4e6;
+  --p-primary-200: #fecdd3;
+  --p-primary-300: #fda4af;
+  --p-primary-400: #fb7185;
+  --p-primary-500: #f43f5e;
+  --p-primary-600: #e11d48;
+  --p-primary-700: #be123c;
+  --p-primary-800: #9f1239;
+  --p-primary-900: #881337;
+  --p-primary-950: #4c0519;
+  --p-primary-color: #f43f5e;
+  --p-primary-hover-color: #e11d48;
+  --p-primary-active-color: #be123c;
+  --p-primary-contrast-color: #ffffff;
+}
+
+html[data-accent='amber'] {
+  --p-primary-50: #fffbeb;
+  --p-primary-100: #fef3c7;
+  --p-primary-200: #fde68a;
+  --p-primary-300: #fcd34d;
+  --p-primary-400: #fbbf24;
+  --p-primary-500: #f59e0b;
+  --p-primary-600: #d97706;
+  --p-primary-700: #b45309;
+  --p-primary-800: #92400e;
+  --p-primary-900: #78350f;
+  --p-primary-950: #451a03;
+  --p-primary-color: #f59e0b;
+  --p-primary-hover-color: #d97706;
+  --p-primary-active-color: #b45309;
+  --p-primary-contrast-color: #1c1917;
+}
+
+html[data-accent='cyan'] {
+  --p-primary-50: #ecfeff;
+  --p-primary-100: #cffafe;
+  --p-primary-200: #a5f3fc;
+  --p-primary-300: #67e8f9;
+  --p-primary-400: #22d3ee;
+  --p-primary-500: #06b6d4;
+  --p-primary-600: #0891b2;
+  --p-primary-700: #0e7490;
+  --p-primary-800: #155e75;
+  --p-primary-900: #164e63;
+  --p-primary-950: #083344;
+  --p-primary-color: #06b6d4;
+  --p-primary-hover-color: #0891b2;
+  --p-primary-active-color: #0e7490;
+  --p-primary-contrast-color: #ffffff;
+}
+
+/* TabView: без отдельной белой подложки под панелями в тёмной теме */
+html.dark-mode .p-tabview .p-tabview-panels {
+  background: transparent;
+}

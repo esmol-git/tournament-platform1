@@ -1,7 +1,10 @@
-import { computed, nextTick, type Ref, ref } from 'vue'
+import { computed, nextTick, watch, type Ref, ref } from 'vue'
 import type { PlayerTeam } from '~/types/admin/player'
 
 export type AuthFetchFn = <T>(url: string, options?: any) => Promise<T>
+
+/** Не дергать /teams заново при каждом открытии селекта, если список свежий. */
+const TEAMS_SELECT_CACHE_TTL_MS = 120_000
 
 export interface UseLazyPaginatedTeamsSelectOptions {
   /** Класс на обёртке Select (внутри ищется `.p-select-list-container`) */
@@ -16,6 +19,10 @@ export interface UseLazyPaginatedTeamsSelectOptions {
 /**
  * Ленивая пагинация команд в PrimeVue Select (фильтр + бесконечный скролл в панели).
  * Два независимых экземпляра — для формы и для фильтра таблицы.
+ *
+ * `:loading` на Select — встроенный индикатор PrimeVue (см. страницы игроков).
+ * Повторный запрос при открытии панели не делаем, если данные ещё в TTL, тот же тенант,
+ * список не после поиска в панели; сброс при смене роут/тенанта.
  */
 export function useLazyPaginatedTeamsSelect(opts: UseLazyPaginatedTeamsSelectOptions) {
   const pageSize = opts.pageSize ?? 10
@@ -29,10 +36,38 @@ export function useLazyPaginatedTeamsSelect(opts: UseLazyPaginatedTeamsSelectOpt
   const teamsNameFilter = ref('')
   const selectedTeamCache = ref<PlayerTeam | null>(null)
 
+  const lastSuccessFetchAt = ref(0)
+  const lastFetchTenantId = ref<string | null>(null)
+  /** Последняя подгрузка была с непустым поиском в панели — кэш «полного» списка невалиден. */
+  const loadedWithActiveFilter = ref(false)
+
   const teamsHasMore = computed(() => teamsLoaded.value.length < teamsTotal.value)
 
   let teamFilterDebounce: ReturnType<typeof setTimeout> | null = null
   let teamPanelScrollCleanup: (() => void) | null = null
+
+  function invalidateTeamsCache() {
+    teamsLoaded.value = []
+    teamsTotal.value = 0
+    teamsPage.value = 0
+    lastSuccessFetchAt.value = 0
+    lastFetchTenantId.value = null
+    loadedWithActiveFilter.value = false
+  }
+
+  if (import.meta.client) {
+    const route = useRoute()
+    watch(
+      () => route.fullPath,
+      () => invalidateTeamsCache(),
+    )
+    watch(
+      () => opts.tenantId.value,
+      (id, prev) => {
+        if (prev !== undefined && id !== prev) invalidateTeamsCache()
+      },
+    )
+  }
 
   async function fillTeamPanelUntilScrollable(depth = 0): Promise<void> {
     if (depth > 25 || !teamsHasMore.value) return
@@ -86,6 +121,11 @@ export function useLazyPaginatedTeamsSelect(opts: UseLazyPaginatedTeamsSelectOpt
           teamsLoaded.value.push(t)
         }
       }
+      if (reset) {
+        lastSuccessFetchAt.value = Date.now()
+        lastFetchTenantId.value = opts.tenantId.value
+        loadedWithActiveFilter.value = nameQ.length > 0
+      }
       await fillTeamPanelUntilScrollable()
     } finally {
       busy.value = false
@@ -102,8 +142,7 @@ export function useLazyPaginatedTeamsSelect(opts: UseLazyPaginatedTeamsSelectOpt
     }, 300)
   }
 
-  const onTeamSelectPanelShow = () => {
-    void fetchTeamsPage({ reset: true })
+  function attachPanelScrollListener() {
     nextTick(() => {
       setTimeout(() => {
         teamPanelScrollCleanup?.()
@@ -127,9 +166,28 @@ export function useLazyPaginatedTeamsSelect(opts: UseLazyPaginatedTeamsSelectOpt
     })
   }
 
+  const onTeamSelectPanelShow = () => {
+    const freshEnough =
+      teamsLoaded.value.length > 0 &&
+      !loadedWithActiveFilter.value &&
+      opts.tenantId.value === lastFetchTenantId.value &&
+      Date.now() - lastSuccessFetchAt.value < TEAMS_SELECT_CACHE_TTL_MS
+
+    if (!freshEnough) {
+      void fetchTeamsPage({ reset: true })
+    }
+    attachPanelScrollListener()
+    if (freshEnough) {
+      void fillTeamPanelUntilScrollable()
+    }
+  }
+
   const onTeamSelectPanelHide = () => {
     teamPanelScrollCleanup?.()
     teamsNameFilter.value = ''
+    if (loadedWithActiveFilter.value) {
+      invalidateTeamsCache()
+    }
   }
 
   return {

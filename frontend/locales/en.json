@@ -1,0 +1,137 @@
+{
+  "admin": {
+    "sidebar": {
+      "brand_title": "Admin · Tournament Platform",
+      "brand_subtitle": "Organizer panel",
+      "collapse": "Collapse sidebar",
+      "expand": "Expand sidebar",
+      "to_site": "Open site",
+      "logout": "Log out"
+    },
+    "nav": {
+      "dashboard": "Dashboard",
+      "settings": "Settings",
+      "group_people": "People & teams",
+      "users": "Users",
+      "teams": "Teams",
+      "players": "Players",
+      "group_references": "Directories",
+      "categories": "Categories",
+      "ref_competitions": "Competitions",
+      "seasons": "Seasons",
+      "documents": "Documents",
+      "referees": "Referees",
+      "referee_categories": "Referee categories",
+      "referee_positions": "Referee positions",
+      "stadiums": "Stadiums",
+      "management": "Management",
+      "group_tournaments": "Competitions",
+      "tournaments": "Tournaments",
+      "matches": "Matches",
+      "calendar": "Calendar"
+    },
+    "logout": {
+      "title": "Confirm sign out",
+      "message": "Are you sure you want to leave the admin panel?",
+      "cancel": "Cancel",
+      "confirm": "Log out"
+    },
+    "settings": {
+      "title": "Settings",
+      "loading": "Loading settings…",
+      "intro": "Theme, language, and accent apply immediately and are stored in this browser. Use Save to sync them to your account on the server.",
+      "save": "Save",
+      "save_hint": "Write the current settings to your account on the server.",
+      "saved": "Saved to your profile",
+      "save_error": "Could not save to the server. Check network and sign-in.",
+      "theme": {
+        "title": "Theme",
+        "hint": "“Match system” follows your OS appearance.",
+        "light": "Light",
+        "dark": "Dark",
+        "system": "Match system"
+      },
+      "language": {
+        "title": "Interface language",
+        "hint": "App copy and PrimeVue component labels.",
+        "ru": "Russian",
+        "en": "English"
+      },
+      "accent": {
+        "title": "Accent color",
+        "hint": "Primary color for buttons and highlights."
+      },
+      "future": {
+        "title": "Coming later",
+        "density": "UI density, date/time format defaults."
+      }
+    },
+    "accent": {
+      "emerald": "Emerald",
+      "blue": "Blue",
+      "violet": "Violet",
+      "rose": "Rose",
+      "amber": "Amber",
+      "cyan": "Cyan"
+    },
+    "dashboard": {
+      "title": "Admin panel",
+      "subtitle": "Overview of tournaments, teams, and upcoming matches.",
+      "greeting": "Hello, {name}!",
+      "refresh": "Refresh",
+      "load_error": "Could not load dashboard data.",
+      "load_error_title": "Load error",
+      "kpi": {
+        "tournaments": "Tournaments",
+        "active_short": "active",
+        "draft_short": "drafts",
+        "done_short": "completed",
+        "go_tournaments": "Open tournaments",
+        "teams": "Teams",
+        "go_teams": "Open teams",
+        "players": "Players",
+        "go_players": "Open players",
+        "matches": "Scheduled matches",
+        "live_now": "Live now: {n}",
+        "go_matches": "Open matches"
+      },
+      "upcoming": {
+        "title": "Upcoming matches",
+        "subtitle": "Scheduled total: {n}",
+        "empty": "No scheduled matches yet — create a tournament and calendar first."
+      },
+      "quick": {
+        "title": "Quick links",
+        "hint": "Counts are for your tenant. Refresh to load the latest numbers."
+      },
+      "charts": {
+        "tournaments_title": "Tournaments by status",
+        "tournaments_subtitle": "Active, drafts, and completed",
+        "tournaments_empty": "No tournaments yet",
+        "entities_title": "Teams, players & schedule",
+        "entities_hint": "Scale comparison across your tenant (absolute counts).",
+        "legend_active": "Active",
+        "legend_draft": "Drafts",
+        "legend_done": "Completed"
+      },
+      "card_tournaments_title": "Tournaments",
+      "card_tournaments_desc": "Manage tournaments, schedule and bracket.",
+      "card_matches_title": "Matches",
+      "card_matches_desc": "Quick access to upcoming and past matches."
+    },
+    "ref": {
+      "competitions": { "title": "Competitions", "desc": "Competition types directory." },
+      "seasons": { "title": "Seasons" },
+      "documents": { "title": "Documents" },
+      "referees": { "title": "Referees" },
+      "referee_categories": { "title": "Referee categories" },
+      "referee_positions": { "title": "Referee positions" },
+      "stadiums": { "title": "Stadiums" },
+      "management": { "title": "Management", "desc": "Leadership / board." }
+    },
+    "stub": {
+      "placeholder": "This section is under construction.",
+      "info": "More features will arrive in future iterations."
+    }
+  }
+}

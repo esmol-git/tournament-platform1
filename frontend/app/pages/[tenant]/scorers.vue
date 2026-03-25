@@ -3,9 +3,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { TournamentDetails } from '~/types/tournament-admin'
 import type { TournamentRow } from '~/types/admin/tournaments-index'
-import type { TeamPlayerRow } from '~/types/admin/team'
-import { useApiUrl } from '~/composables/useApiUrl'
-import { useAuth } from '~/composables/useAuth'
+import { usePublicTournamentFetch } from '~/composables/usePublicTournamentFetch'
+import { usePublicTenantContext } from '~/composables/usePublicTenantContext'
 import PublicHeader from '~/app/components/public/PublicHeader.vue'
 import PublicTournamentSidebar from '~/app/components/public/PublicTournamentSidebar.vue'
 
@@ -13,13 +12,12 @@ definePageMeta({ layout: 'public' })
 
 const route = useRoute()
 const router = useRouter()
-const { apiUrl } = useApiUrl()
-const { token, syncWithStorage, authFetch } = useAuth()
+const { loadAllTournaments, fetchTournamentDetail, fetchRoster } = usePublicTournamentFetch()
 
-const tenant = computed(() => route.params.tenant as string)
-
-const authRequired = ref(false)
+const { tenantSlug, selectedTid, ensureTenantResolved, tenantNotFound } = usePublicTenantContext()
+const tenant = tenantSlug
 const errorText = ref('')
+const pageReady = ref(false)
 
 const tournaments = ref<TournamentRow[]>([])
 const selectedTournamentId = ref<string>('')
@@ -33,6 +31,16 @@ const scorersLoading = ref(false)
 const goals = ref<PlayerStatRow[]>([])
 const assists = ref<PlayerStatRow[]>([])
 const cards = ref<PlayerStatRow[]>([])
+const showPageSkeleton = computed(() => {
+  return (
+    !pageReady.value ||
+    loading.value ||
+    (scorersLoading.value &&
+      !goals.value.length &&
+      !assists.value.length &&
+      !cards.value.length)
+  )
+})
 
 type PlayerStatRow = {
   rank: number
@@ -42,19 +50,12 @@ type PlayerStatRow = {
   value: number
 }
 
-function getTidFromQuery(): string | null {
-  const tid = route.query.tid
-  return typeof tid === 'string' && tid.trim() ? tid : null
-}
-
 function syncTidToQuery(nextId: string | null) {
   const q: Record<string, any> = { ...route.query }
   if (nextId) q.tid = nextId
   else delete q.tid
   void router.replace({ query: q })
 }
-
-selectedTournamentId.value = getTidFromQuery() ?? ''
 
 function playerFullName(p: { firstName: string; lastName: string } | null | undefined) {
   if (!p) return '—'
@@ -64,61 +65,38 @@ function playerFullName(p: { firstName: string; lastName: string } | null | unde
   return last || first || '—'
 }
 
-async function fetchTeamPlayers(teamId: string) {
-  if (!token.value) return []
-  const res = await authFetch<{ items: TeamPlayerRow[]; total: number }>(
-    apiUrl(`/tenants/${tenant.value}/teams/${teamId}/players`),
-    {
-      headers: { Authorization: `Bearer ${token.value}` },
-      params: { page: 1, pageSize: 200 },
-    },
-  )
-  return res.items ?? []
-}
-
 async function fetchTournaments() {
-  if (!token.value) {
-    authRequired.value = true
+  errorText.value = ''
+  loading.value = true
+  try {
+    const loaded = await loadAllTournaments(tenant.value)
+
+    tournaments.value = loaded
+    const ids = new Set(loaded.map((t) => t.id))
+    if (selectedTournamentId.value && !ids.has(selectedTournamentId.value)) {
+      selectedTournamentId.value = ''
+    }
+    if (!selectedTournamentId.value) {
+      selectedTournamentId.value = loaded[0]?.id ?? ''
+      syncTidToQuery(selectedTournamentId.value || null)
+    }
+  } catch (e: any) {
     tournaments.value = []
     goals.value = []
     assists.value = []
     cards.value = []
-    return
-  }
-
-  authRequired.value = false
-  errorText.value = ''
-  loading.value = true
-  try {
-    const data = await authFetch<TournamentRow[]>(
-      apiUrl(`/tenants/${tenant.value}/tournaments`),
-      { headers: { Authorization: `Bearer ${token.value}` } },
-    )
-    tournaments.value = data
-
-    if (!selectedTournamentId.value) {
-      const active = data.find((t) => t.status === 'ACTIVE')
-      selectedTournamentId.value = active?.id ?? data[0]?.id ?? ''
-      syncTidToQuery(selectedTournamentId.value || null)
-    }
-  } catch (e: any) {
     const status = e?.response?.status ?? e?.statusCode
-    if (status === 401) {
-      authRequired.value = true
-      tournaments.value = []
-      goals.value = []
-      assists.value = []
-      cards.value = []
-      return
-    }
-    errorText.value = 'Не удалось загрузить турниры.'
+    errorText.value =
+      status === 404
+        ? 'Тенант не найден. Проверьте ссылку.'
+        : 'Не удалось загрузить турниры.'
   } finally {
     loading.value = false
   }
 }
 
 async function fetchScorers() {
-  if (!selectedTournamentId.value || !token.value) {
+  if (!selectedTournamentId.value) {
     goals.value = []
     assists.value = []
     cards.value = []
@@ -127,40 +105,24 @@ async function fetchScorers() {
 
   scorersLoading.value = true
   errorText.value = ''
+  goals.value = []
+  assists.value = []
+  cards.value = []
   try {
-    const res = await authFetch<TournamentDetails>(apiUrl(`/tournaments/${selectedTournamentId.value}`), {
-      headers: { Authorization: `Bearer ${token.value}` },
-    })
-
-    const teamNameById = new Map<string, string>()
-    for (const tt of res.tournamentTeams ?? []) {
-      teamNameById.set(tt.teamId, tt.team.name)
-    }
-
-    const teamIds = new Set<string>()
-    for (const m of res.matches ?? []) {
-      if (m.homeTeam?.id) teamIds.add(m.homeTeam.id)
-      if (m.awayTeam?.id) teamIds.add(m.awayTeam.id)
-    }
+    const tid = selectedTournamentId.value
+    const res = await fetchTournamentDetail(tenant.value, tid)
+    const roster = await fetchRoster(tenant.value, tid)
 
     const playersById = new Map<string, { playerName: string; teamName: string | null }>()
-
-    await Promise.all(
-      Array.from(teamIds).map(async (teamId) => {
-        try {
-          const items = await fetchTeamPlayers(teamId)
-          const tn = teamNameById.get(teamId) ?? null
-          for (const tp of items) {
-            playersById.set(tp.playerId, {
-              playerName: playerFullName(tp.player),
-              teamName: tn,
-            })
-          }
-        } catch {
-          // ignore per-team roster errors
-        }
-      }),
-    )
+    for (const row of roster) {
+      const tn = row.teamName ?? null
+      for (const p of row.players) {
+        playersById.set(p.id, {
+          playerName: playerFullName(p),
+          teamName: tn,
+        })
+      }
+    }
 
     const goalsMap = new Map<string, number>()
     const assistsMap = new Map<string, number>()
@@ -222,9 +184,24 @@ watch(selectedTournamentId, () => {
 })
 
 onMounted(async () => {
-  syncWithStorage()
-  await fetchTournaments()
-  await fetchScorers()
+  try {
+    await ensureTenantResolved()
+
+    if (tenantNotFound.value) {
+      errorText.value = 'Тенант не найден. Проверьте ссылку.'
+      return
+    }
+
+    if (String(route.params.tenant ?? '') !== tenant.value) {
+      await router.replace({ params: { tenant: tenant.value }, query: route.query })
+    }
+
+    selectedTournamentId.value = selectedTid.value ?? ''
+    await fetchTournaments()
+    await fetchScorers()
+  } finally {
+    pageReady.value = true
+  }
 })
 </script>
 
@@ -234,6 +211,29 @@ onMounted(async () => {
 
     <div class="mx-auto max-w-6xl px-4 py-5 grid grid-cols-1 lg:grid-cols-[1fr_22rem] gap-6">
       <div class="space-y-4">
+        <div v-if="showPageSkeleton" class="space-y-4">
+          <div class="rounded-2xl border border-surface-200 bg-surface-0 p-4">
+            <Skeleton width="16rem" height="2rem" />
+            <Skeleton class="mt-4" width="22rem" height="2.75rem" />
+          </div>
+          <div class="rounded-2xl border border-surface-200 bg-surface-0 p-4">
+            <Skeleton width="11rem" height="1rem" />
+            <div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <div
+                v-for="i in 3"
+                :key="`sc-sk-${i}`"
+                class="rounded-xl border border-surface-200 bg-surface-0 p-4"
+              >
+                <Skeleton width="8rem" height="1rem" />
+                <Skeleton class="mt-3" width="100%" height="1.25rem" />
+                <Skeleton class="mt-2" width="100%" height="1.25rem" />
+                <Skeleton class="mt-2" width="100%" height="1.25rem" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <template v-else>
         <div class="rounded-2xl border border-surface-200 bg-surface-0 p-4">
           <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div class="min-w-0">
@@ -259,10 +259,7 @@ onMounted(async () => {
           </div>
         </div>
 
-        <div v-if="authRequired" class="rounded-2xl border border-amber-300 bg-amber-50 p-5 text-amber-900">
-          Для просмотра нужна авторизация.
-        </div>
-        <div v-else-if="errorText" class="rounded-2xl border border-red-300 bg-red-50 p-5 text-red-900">
+        <div v-if="errorText" class="rounded-2xl border border-red-300 bg-red-50 p-5 text-red-900">
           {{ errorText }}
         </div>
 
@@ -342,6 +339,7 @@ onMounted(async () => {
             </div>
           </div>
         </div>
+        </template>
       </div>
 
       <PublicTournamentSidebar

@@ -10,7 +10,9 @@ import {
 } from '~/composables/useLazyPaginatedTeamsSelect'
 import type { PlayerRow } from '~/types/admin/player'
 import { getApiErrorMessage } from '~/utils/apiError'
+import { MIN_SKELETON_DISPLAY_MS, sleepRemainingAfter } from '~/utils/minimumLoadingDelay'
 import { toYmdLocal as toYmd } from '~/utils/dateYmd'
+import { formatAgeFromIsoDate } from '~/utils/ageYearsRu'
 import { useRouter } from 'vue-router'
 
 definePageMeta({ layout: 'admin' })
@@ -28,6 +30,28 @@ const positionFilterOptions = computed(() => [
   { value: '', label: 'Все амплуа' },
   ...PLAYER_POSITION_OPTIONS,
 ])
+
+const genderOptions = [
+  { value: 'MALE' as const, label: 'Мужской' },
+  { value: 'FEMALE' as const, label: 'Женский' },
+]
+
+/** Фильтр по году рождения: только допустимый диапазон (дети младше 4 лет в справочнике не нужны) */
+const MIN_BIRTH_YEAR_FILTER = 1950
+
+function maxBirthYearForFilter(): number {
+  return new Date().getFullYear() - 4
+}
+
+const birthYearFilterOptions = computed(() => {
+  const max = maxBirthYearForFilter()
+  const min = MIN_BIRTH_YEAR_FILTER
+  const opts: { value: number | ''; label: string }[] = [{ value: '', label: 'Все годы' }]
+  for (let y = max; y >= min; y -= 1) {
+    opts.push({ value: y, label: String(y) })
+  }
+  return opts
+})
 
 /** Селект «Команда» в форме и в фильтре таблицы — ленивая пагинация через composable */
 const {
@@ -65,7 +89,12 @@ const {
   apiUrl,
 })
 
-const loading = ref(false)
+/** true до первого завершённого запроса — иначе при F5 один кадр с пустым списком и «Нет игроков». */
+const loading = ref(true)
+const PLAYERS_TABLE_SKELETON_ROWS = 10
+const skeletonPlayerRows = Array.from({ length: PLAYERS_TABLE_SKELETON_ROWS }, (_, i) => ({
+  id: `__psk-${i}`,
+}))
 const players = ref<PlayerRow[]>([])
 const totalPlayers = ref(0)
 
@@ -82,41 +111,71 @@ const filters = reactive({
   position: '',
   /** Фильтр по команде (id) */
   teamId: '',
-  /** Диапазон дат рождения [от, до] — как в PrimeVue selectionMode="range" */
-  birthDateRange: null as Date[] | null,
+  /** Год рождения: '' — не фильтровать; иначе число в [MIN_BIRTH_YEAR_FILTER .. maxBirthYearForFilter()] */
+  birthYear: '' as number | '',
 })
 
 let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
-/** Те же фильтры/сортировка, что у таблицы (без пагинации) — для экспорта CSV */
-const buildPlayerExportParams = (): Record<string, string | number> => {
+/** Те же фильтры и сортировка, что у таблицы (без page/pageSize) — для GET .../players/export/csv на бэкенде */
+function buildPlayersFilterSortParams(): Record<string, string | number> {
   const params: Record<string, string | number> = {}
   if (sortField.value) params.sortField = sortField.value
   if (sortOrder.value === 1 || sortOrder.value === -1) params.sortOrder = sortOrder.value
   if (filters.name.trim()) params.name = filters.name.trim()
   if (filters.position.trim()) params.position = filters.position.trim()
   if (filters.teamId.trim()) params.teamId = filters.teamId.trim()
-  const br = filters.birthDateRange
-  if (br && br.length >= 2 && br[0] && br[1]) {
-    const a = br[0]
-    const b = br[1]
-    const from = a <= b ? a : b
-    const to = a <= b ? b : a
-    params.birthDateFrom = toYmd(from)
-    params.birthDateTo = toYmd(to)
+  const by = filters.birthYear
+  if (by !== '') {
+    const yearNum = typeof by === 'number' ? by : Number(by)
+    const maxY = maxBirthYearForFilter()
+    if (
+      Number.isInteger(yearNum) &&
+      yearNum >= MIN_BIRTH_YEAR_FILTER &&
+      yearNum <= maxY
+    ) {
+      params.birthDateFrom = `${yearNum}-01-01`
+      params.birthDateTo = `${yearNum}-12-31`
+    }
   }
   return params
 }
+
+const buildPlayersQueryParams = (
+  page: number,
+  pageSizeNum: number,
+): Record<string, string | number> => ({
+  page,
+  pageSize: pageSizeNum,
+  ...buildPlayersFilterSortParams(),
+})
 
 const csvDownloading = ref(false)
 const csvImporting = ref(false)
 const csvFileInput = ref<HTMLInputElement | null>(null)
 
+/** Соответствует query `mode` на POST .../players/import/csv */
+const csvImportMode = ref<'upsert' | 'createOnly' | 'updateOnly'>('upsert')
+const csvImportModeOptions = [
+  {
+    value: 'upsert' as const,
+    label: 'Создать и обновить по id',
+  },
+  {
+    value: 'createOnly' as const,
+    label: 'Только новые (строки с id не трогать)',
+  },
+  {
+    value: 'updateOnly' as const,
+    label: 'Только обновить по id (без id — пропустить)',
+  },
+]
+
 const downloadPlayersCsv = async () => {
   if (!token.value) return
   csvDownloading.value = true
   try {
-    const params = buildPlayerExportParams()
+    const params = buildPlayersFilterSortParams()
     const blob = await authFetchBlob(apiUrl(`/tenants/${tenantId.value}/players/export/csv`), {
       params,
     })
@@ -129,8 +188,9 @@ const downloadPlayersCsv = async () => {
     toast.add({
       severity: 'success',
       summary: 'CSV скачан',
-      detail: 'До 20 000 строк с учётом текущих фильтров.',
-      life: 4000,
+      detail:
+        'Файл сформирован на сервере (до 20 000 строк): id, teamId, даты YYYY-MM-DD — удобно для обратного импорта.',
+      life: 5000,
     })
   } catch (err: unknown) {
     toast.add({
@@ -159,11 +219,17 @@ const onCsvFileChange = async (e: Event) => {
   try {
     const fd = new FormData()
     fd.append('file', file)
+    const importPath = `/tenants/${tenantId.value}/players/import/csv`
+    const q =
+      csvImportMode.value === 'upsert'
+        ? ''
+        : `?mode=${encodeURIComponent(csvImportMode.value)}`
     const res = await authFetch<{
       created: number
       updated: number
+      skipped: number
       errors: Array<{ row: number; message: string }>
-    }>(apiUrl(`/tenants/${tenantId.value}/players/import/csv`), {
+    }>(apiUrl(`${importPath}${q}`), {
       method: 'POST',
       body: fd,
     })
@@ -172,6 +238,7 @@ const onCsvFileChange = async (e: Event) => {
 
     const errList = res.errors ?? []
     const errCount = errList.length
+    const skipped = res.skipped ?? 0
     const preview =
       errCount > 0
         ? ` Строки с ошибками: ${errList
@@ -183,7 +250,9 @@ const onCsvFileChange = async (e: Event) => {
     toast.add({
       severity: errCount ? 'warn' : 'success',
       summary: errCount ? 'Импорт завершён с ошибками' : 'Импорт выполнен',
-      detail: `Создано: ${res.created}, обновлено: ${res.updated}.${preview}`,
+      detail: `Создано: ${res.created}, обновлено: ${res.updated}${
+        skipped ? `, пропущено: ${skipped}` : ''
+      }.${preview}`,
       life: errCount ? 12000 : 5000,
     })
   } catch (err: unknown) {
@@ -199,30 +268,17 @@ const onCsvFileChange = async (e: Event) => {
 }
 
 const fetchPlayers = async () => {
-  if (!token.value) return
+  if (!token.value) {
+    loading.value = false
+    return
+  }
+  const loadStartedAt = Date.now()
   loading.value = true
   const page = Math.max(1, Math.floor(Number(currentPage.value) || 1))
   const pageSizeNum = Math.max(1, Math.floor(Number(pageSize.value) || 10))
 
   try {
-    const params: Record<string, any> = {
-      page,
-      pageSize: pageSizeNum,
-    }
-    if (sortField.value) params.sortField = sortField.value
-    if (sortOrder.value === 1 || sortOrder.value === -1) params.sortOrder = sortOrder.value
-    if (filters.name.trim()) params.name = filters.name.trim()
-    if (filters.position.trim()) params.position = filters.position.trim()
-    if (filters.teamId.trim()) params.teamId = filters.teamId.trim()
-    const br = filters.birthDateRange
-    if (br && br.length >= 2 && br[0] && br[1]) {
-      const a = br[0]
-      const b = br[1]
-      const from = a <= b ? a : b
-      const to = a <= b ? b : a
-      params.birthDateFrom = toYmd(from)
-      params.birthDateTo = toYmd(to)
-    }
+    const params = buildPlayersQueryParams(page, pageSizeNum)
 
     const res = await authFetch<{ items: PlayerRow[]; total: number }>(
       apiUrl(`/tenants/${tenantId.value}/players`),
@@ -235,6 +291,7 @@ const fetchPlayers = async () => {
     players.value = res.items
     totalPlayers.value = res.total
   } finally {
+    await sleepRemainingAfter(MIN_SKELETON_DISPLAY_MS, loadStartedAt)
     loading.value = false
   }
 }
@@ -250,7 +307,7 @@ const scheduleFilterFetch = () => {
 }
 
 watch(
-  () => [filters.name, filters.position, filters.teamId, filters.birthDateRange] as const,
+  () => [filters.name, filters.position, filters.teamId, filters.birthYear] as const,
   () => scheduleFilterFetch(),
   { deep: true },
 )
@@ -282,6 +339,8 @@ const onPlayersSort = (event: any) => {
   fetchPlayers()
 }
 
+const showPlayersPaginator = computed(() => totalPlayers.value > PLAYERS_TABLE_SKELETON_ROWS)
+
 const resetFilters = () => {
   if (filterDebounceTimer) {
     clearTimeout(filterDebounceTimer)
@@ -290,7 +349,7 @@ const resetFilters = () => {
   filters.name = ''
   filters.position = ''
   filters.teamId = ''
-  filters.birthDateRange = null
+  filters.birthYear = ''
   listFilterSelectedTeamCache.value = null
   currentPage.value = 1
   first.value = 0
@@ -306,6 +365,7 @@ const form = reactive({
   firstName: '',
   lastName: '',
   birthDate: null as Date | null,
+  gender: '' as '' | 'MALE' | 'FEMALE',
   position: '',
   phone: '',
   bioNumber: '',
@@ -348,6 +408,7 @@ const openCreate = () => {
   form.firstName = ''
   form.lastName = ''
   form.birthDate = null
+  form.gender = ''
   form.position = ''
   form.phone = ''
   form.bioNumber = ''
@@ -363,6 +424,7 @@ const openEdit = (p: PlayerRow) => {
   form.firstName = p.firstName ?? ''
   form.lastName = p.lastName ?? ''
   form.birthDate = p.birthDate ? new Date(p.birthDate) : null
+  form.gender = p.gender ?? ''
   form.position = p.position ?? ''
   form.phone = p.phone ?? ''
   form.bioNumber = p.bioNumber ?? ''
@@ -492,6 +554,7 @@ const savePlayer = async () => {
     const payload: any = {
       firstName: form.firstName,
       lastName: form.lastName,
+      gender: form.gender || undefined,
       position: form.position || undefined,
       phone: form.phone || undefined,
       birthDate: form.birthDate ? toYmd(form.birthDate) : undefined,
@@ -520,30 +583,70 @@ const savePlayer = async () => {
 
     showForm.value = false
     await fetchPlayers()
+    toast.add({
+      severity: 'success',
+      summary: isEdit.value ? 'Игрок обновлен' : 'Игрок создан',
+      life: 2500,
+    })
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: isEdit.value ? 'Не удалось обновить игрока' : 'Не удалось создать игрока',
+      detail: getApiErrorMessage(err),
+      life: 7000,
+    })
   } finally {
     saving.value = false
   }
 }
 
-const deletePlayer = async (p: PlayerRow) => {
-  if (!token.value) return
-  if (!confirm(`Удалить игрока "${p.lastName} ${p.firstName}"?`)) return
-  await authFetch(apiUrl(`/tenants/${tenantId.value}/players/${p.id}`), {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token.value}` },
-  })
-  await fetchPlayers()
+const deletePlayerConfirmOpen = ref(false)
+const deletePlayerPending = ref<PlayerRow | null>(null)
+
+const deletePlayerMessage = computed(() => {
+  const p = deletePlayerPending.value
+  if (!p) return ''
+  return `Удалить игрока «${p.lastName} ${p.firstName}»? Действие необратимо.`
+})
+
+function requestDeletePlayer(p: PlayerRow) {
+  deletePlayerPending.value = p
+  deletePlayerConfirmOpen.value = true
+}
+
+async function confirmDeletePlayer() {
+  const p = deletePlayerPending.value
+  if (!token.value || !p) return
+  try {
+    await authFetch(apiUrl(`/tenants/${tenantId.value}/players/${p.id}`), {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token.value}` },
+    })
+    await fetchPlayers()
+    toast.add({ severity: 'success', summary: 'Игрок удалён', life: 2500 })
+  } catch (err: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: 'Не удалось удалить игрока',
+      detail: getApiErrorMessage(err),
+      life: 6000,
+    })
+  } finally {
+    deletePlayerPending.value = null
+  }
 }
 
 onMounted(() => {
   if (typeof window !== 'undefined') {
     syncWithStorage()
     if (!loggedIn.value) {
+      loading.value = false
       router.push('/admin/login')
       return
     }
   }
-  fetchPlayers()
+  currentPage.value = 1
+  void fetchPlayers()
 })
 </script>
 
@@ -564,6 +667,17 @@ onMounted(() => {
           :disabled="csvImporting"
           @click="downloadPlayersCsv"
         />
+        <FloatLabel variant="on" class="min-w-0 w-full max-w-[20rem] sm:max-w-[22rem]">
+          <Select
+            v-model="csvImportMode"
+            :options="csvImportModeOptions"
+            option-label="label"
+            option-value="value"
+            class="w-full"
+            :disabled="csvImporting"
+          />
+          <label>Режим импорта CSV</label>
+        </FloatLabel>
         <Button
           label="Загрузить CSV"
           icon="pi pi-upload"
@@ -579,6 +693,14 @@ onMounted(() => {
           accept=".csv,text/csv"
           class="hidden"
           @change="onCsvFileChange"
+        />
+        <Button
+          label="Обновить"
+          icon="pi pi-refresh"
+          text
+          severity="secondary"
+          :loading="loading"
+          @click="fetchPlayers()"
         />
         <Button label="Создать" icon="pi pi-plus" @click="openCreate" />
       </div>
@@ -633,15 +755,14 @@ onMounted(() => {
         <label>Команда</label>
       </FloatLabel>
       <FloatLabel variant="on" class="min-w-0 sm:col-span-2 xl:col-span-4">
-        <DatePicker
-          v-model="filters.birthDateRange"
+        <Select
+          v-model="filters.birthYear"
+          :options="birthYearFilterOptions"
+          option-label="label"
+          option-value="value"
           class="w-full"
-          dateFormat="yy-mm-dd"
-          showIcon
-          selectionMode="range"
-          placeholder="Дата рождения: от — до"
         />
-        <label>Дата рождения</label>
+        <label>Год рождения</label>
       </FloatLabel>
 
       <div class="flex justify-end pt-1 sm:col-span-2 xl:col-span-12">
@@ -650,18 +771,70 @@ onMounted(() => {
     </div>
 
     <DataTable
+      v-if="loading"
+      :value="skeletonPlayerRows"
+      striped-rows
+      data-key="id"
+      class="min-h-[28rem]"
+      aria-busy="true"
+    >
+      <Column header="Игрок" style="min-width: 14rem">
+        <template #body>
+          <div class="flex min-w-0 items-center gap-3">
+            <Skeleton width="2rem" height="0.75rem" class="rounded-md" />
+            <Skeleton width="2.5rem" height="2.5rem" class="rounded-lg" />
+            <Skeleton width="55%" height="1rem" class="rounded-md" />
+          </div>
+        </template>
+      </Column>
+      <Column header="Команда" style="min-width: 11rem">
+        <template #body>
+          <div class="flex items-center gap-2">
+            <Skeleton width="2rem" height="2rem" class="rounded-md" />
+            <Skeleton width="65%" height="0.875rem" class="rounded-md" />
+          </div>
+        </template>
+      </Column>
+      <Column header="Дата рождения">
+        <template #body>
+          <Skeleton width="5.5rem" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Возраст" style="min-width: 6rem">
+        <template #body>
+          <Skeleton width="4rem" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Амплуа">
+        <template #body>
+          <Skeleton width="4.5rem" height="1rem" class="rounded-md" />
+        </template>
+      </Column>
+      <Column header="Действия" style="width: 8rem">
+        <template #body>
+          <div class="flex justify-end gap-2">
+            <Skeleton shape="circle" width="2rem" height="2rem" />
+            <Skeleton shape="circle" width="2rem" height="2rem" />
+          </div>
+        </template>
+      </Column>
+    </DataTable>
+
+    <DataTable
+      v-else
       :value="players"
-      :loading="loading"
-      stripedRows
-      :paginator="totalPlayers >= 6"
+      striped-rows
+      :paginator="showPlayersPaginator"
       lazy
-      :totalRecords="totalPlayers"
+      :total-records="totalPlayers"
       :first="first"
       :rows="pageSize"
-      :rowsPerPageOptions="[5, 10, 20, 50]"
+      :rows-per-page-options="[5, 10, 20, 50]"
+      paginator-template="FirstPageLink PrevPageLink PageLinks NextPageLink LastPageLink RowsPerPageDropdown"
+      current-page-report-template="{first}–{last} из {totalRecords}"
       @page="onPlayersPage"
       @sort="onPlayersSort"
-      responsiveLayout="scroll"
+      responsive-layout="scroll"
     >
       <template #empty>
         <div class="flex flex-col items-center justify-center gap-2 py-10 text-muted-color">
@@ -685,7 +858,7 @@ onMounted(() => {
               v-if="data.photoUrl"
               :src="data.photoUrl"
               :alt="`${data.firstName} ${data.lastName}`"
-              class="w-10 h-10 shrink-0 rounded-lg object-cover border border-surface-200 bg-surface-0"
+              class="w-10 h-10 shrink-0 rounded-lg object-cover"
             />
             <div
               v-else
@@ -707,7 +880,7 @@ onMounted(() => {
               v-if="data.team.logoUrl"
               :src="data.team.logoUrl"
               alt=""
-              class="w-8 h-8 shrink-0 rounded-md object-cover border border-surface-200 bg-surface-0"
+              class="w-8 h-8 shrink-0 rounded-md object-cover"
             />
             <div
               v-else
@@ -727,6 +900,11 @@ onMounted(() => {
           <span v-else class="text-muted-color">—</span>
         </template>
       </Column>
+      <Column header="Возраст" style="min-width: 6.5rem">
+        <template #body="{ data }">
+          <span class="tabular-nums text-surface-800">{{ formatAgeFromIsoDate(data.birthDate) }}</span>
+        </template>
+      </Column>
       <Column field="position" header="Амплуа" sortable>
         <template #body="{ data }">
           <span v-if="data.position">{{ data.position }}</span>
@@ -737,11 +915,18 @@ onMounted(() => {
         <template #body="{ data }">
           <div class="flex gap-2 justify-end">
             <Button icon="pi pi-pencil" text size="small" @click="openEdit(data)" aria-label="Редактировать" />
-            <Button icon="pi pi-trash" text severity="danger" size="small" @click="deletePlayer(data)" aria-label="Удалить" />
+            <Button icon="pi pi-trash" text severity="danger" size="small" @click="requestDeletePlayer(data)" aria-label="Удалить" />
           </div>
         </template>
       </Column>
     </DataTable>
+
+    <AdminConfirmDialog
+      v-model="deletePlayerConfirmOpen"
+      title="Удалить игрока?"
+      :message="deletePlayerMessage"
+      @confirm="confirmDeletePlayer"
+    />
 
     <Dialog
       :visible="showForm"
@@ -755,10 +940,13 @@ onMounted(() => {
         <div class="md:col-span-1 flex items-stretch relative">
           <button
             type="button"
-            class="w-full h-full min-h-44 overflow-hidden rounded-xl border border-surface-200 bg-surface-0 flex items-center justify-center relative leading-none"
-            :class="
-              photoUploading || photoRemoving ? 'cursor-wait opacity-80' : 'cursor-pointer'
-            "
+            class="w-full h-full min-h-44 overflow-hidden rounded-xl bg-surface-0 flex items-center justify-center relative leading-none"
+            :class="[
+              photoUploading || photoRemoving ? 'cursor-wait opacity-80' : 'cursor-pointer',
+              form.photoUrl && !photoUploading && !photoRemoving
+                ? 'border-0'
+                : 'border border-surface-200',
+            ]"
             :disabled="photoUploading || photoRemoving"
             @click="triggerPhotoPick"
             aria-label="Загрузить или заменить фото игрока"
@@ -823,6 +1011,17 @@ onMounted(() => {
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <FloatLabel variant="on" class="block">
               <Select
+                v-model="form.gender"
+                :options="genderOptions"
+                option-label="label"
+                option-value="value"
+                class="w-full"
+              />
+              <label>Пол</label>
+            </FloatLabel>
+
+            <FloatLabel variant="on" class="block">
+              <Select
                 v-model="form.position"
                 :options="positionOptions"
                 option-label="label"
@@ -831,45 +1030,46 @@ onMounted(() => {
               />
               <label>Амплуа</label>
             </FloatLabel>
+          </div>
 
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <FloatLabel variant="on" class="block">
               <InputText v-model="form.bioNumber" class="w-full" />
               <label>Номер игрока</label>
+            </FloatLabel>
+            <FloatLabel variant="on" class="block">
+              <Select
+                v-model="form.teamId"
+                :options="teamSelectOptions"
+                option-label="label"
+                option-value="value"
+                class="w-full"
+                panel-class="player-team-select-panel"
+                :loading="teamsLoading"
+                filter
+                filter-placeholder="Поиск по названию (сервер)"
+                reset-filter-on-hide
+                @show="onTeamSelectPanelShow"
+                @hide="onTeamSelectPanelHide"
+                @filter="onTeamSelectFilter"
+              >
+                <template #footer>
+                  <div
+                    v-if="teamsHasMore || teamsLoadingMore"
+                    class="px-2 py-2 border-t border-surface-200 text-center text-xs text-muted-color"
+                  >
+                    <span v-if="teamsLoadingMore">Загрузка…</span>
+                    <span v-else>Прокрутите список вниз, чтобы подгрузить ещё</span>
+                  </div>
+                </template>
+              </Select>
+              <label>Команда</label>
             </FloatLabel>
           </div>
 
           <FloatLabel variant="on" class="block">
             <InputText v-model="form.phone" class="w-full" />
             <label>Мобильный телефон</label>
-          </FloatLabel>
-
-          <FloatLabel variant="on" class="block">
-            <Select
-              v-model="form.teamId"
-              :options="teamSelectOptions"
-              option-label="label"
-              option-value="value"
-              class="w-full"
-              panel-class="player-team-select-panel"
-              :loading="teamsLoading"
-              filter
-              filter-placeholder="Поиск по названию (сервер)"
-              reset-filter-on-hide
-              @show="onTeamSelectPanelShow"
-              @hide="onTeamSelectPanelHide"
-              @filter="onTeamSelectFilter"
-            >
-              <template #footer>
-                <div
-                  v-if="teamsHasMore || teamsLoadingMore"
-                  class="px-2 py-2 border-t border-surface-200 text-center text-xs text-muted-color"
-                >
-                  <span v-if="teamsLoadingMore">Загрузка…</span>
-                  <span v-else>Прокрутите список вниз, чтобы подгрузить ещё</span>
-                </div>
-              </template>
-            </Select>
-            <label>Команда</label>
           </FloatLabel>
         </div>
 

@@ -13,6 +13,16 @@ const baseQuery = computed(() => {
   if (props.tid) q.tid = props.tid
   return q
 })
+
+const tournamentNavLinks = [
+  { key: 'calendar' as const, suffix: 'calendar', label: 'Календарь' },
+  { key: 'table' as const, suffix: 'table', label: 'Турнирная таблица' },
+  { key: 'players' as const, suffix: 'scorers', label: 'Статистика игроков' },
+] as const
+
+const upcomingSectionLabels = ['Команды', 'Новости', 'Фото', 'Видео', 'Документы'] as const
+
+const socialIcons = ['pi-facebook', 'pi-twitter', 'pi-link'] as const
 </script>
 
 <template>
@@ -29,54 +39,40 @@ const baseQuery = computed(() => {
 
     <nav class="p-2 space-y-1">
       <NuxtLink
-        :to="`/${tenant}/calendar`"
+        v-for="link in tournamentNavLinks"
+        :key="link.key"
+        :to="`/${tenant}/${link.suffix}`"
         :query="baseQuery"
         class="block px-3 py-2 rounded-lg text-sm transition-colors"
-        :class="active === 'calendar' ? 'bg-primary/90 text-white' : 'hover:bg-surface-100 text-surface-700'"
+        :class="active === link.key ? 'bg-primary/90 text-white' : 'hover:bg-surface-100 text-surface-700'"
       >
-        Календарь
-      </NuxtLink>
-
-      <NuxtLink
-        :to="`/${tenant}/table`"
-        :query="baseQuery"
-        class="block px-3 py-2 rounded-lg text-sm transition-colors"
-        :class="active === 'table' ? 'bg-primary/90 text-white' : 'hover:bg-surface-100 text-surface-700'"
-      >
-        Турнирная таблица
-      </NuxtLink>
-
-      <NuxtLink
-        :to="`/${tenant}/scorers`"
-        :query="baseQuery"
-        class="block px-3 py-2 rounded-lg text-sm transition-colors"
-        :class="active === 'players' ? 'bg-primary/90 text-white' : 'hover:bg-surface-100 text-surface-700'"
-      >
-        Статистика игроков
+        {{ link.label }}
       </NuxtLink>
 
       <div class="mt-3 pt-2 border-t border-surface-200">
         <div class="px-3 text-xs uppercase tracking-wide text-muted-color mb-2">Разделы</div>
         <div class="space-y-1">
-          <div class="px-3 py-2 text-sm text-muted-color">Команды (скоро)</div>
-          <div class="px-3 py-2 text-sm text-muted-color">Новости (скоро)</div>
-          <div class="px-3 py-2 text-sm text-muted-color">Фото (скоро)</div>
-          <div class="px-3 py-2 text-sm text-muted-color">Видео (скоро)</div>
-          <div class="px-3 py-2 text-sm text-muted-color">Документы (скоро)</div>
+          <div
+            v-for="label in upcomingSectionLabels"
+            :key="label"
+            class="px-3 py-2 text-sm text-muted-color"
+          >
+            {{ label }} (скоро)
+          </div>
         </div>
       </div>
     </nav>
 
     <div class="p-3 border-t border-surface-200">
       <div class="flex items-center gap-2 justify-start">
-        <a href="#" class="h-8 w-8 rounded-full border border-surface-200 flex items-center justify-center text-muted-color hover:text-primary" @click.prevent>
-          <i class="pi pi-facebook" />
-        </a>
-        <a href="#" class="h-8 w-8 rounded-full border border-surface-200 flex items-center justify-center text-muted-color hover:text-primary" @click.prevent>
-          <i class="pi pi-twitter" />
-        </a>
-        <a href="#" class="h-8 w-8 rounded-full border border-surface-200 flex items-center justify-center text-muted-color hover:text-primary" @click.prevent>
-          <i class="pi pi-link" />
+        <a
+          v-for="icon in socialIcons"
+          :key="icon"
+          href="#"
+          class="h-8 w-8 rounded-full border border-surface-200 flex items-center justify-center text-muted-color hover:text-primary"
+          @click.prevent
+        >
+          <i :class="['pi', icon]" />
         </a>
       </div>
     </div>

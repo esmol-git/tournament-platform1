@@ -13,6 +13,8 @@ import type {
 } from '~/types/tournament-admin'
 import type { TeamPlayerRow } from '~/types/admin/team'
 import { getApiErrorMessage } from '~/utils/apiError'
+import { mergeDateAndTime, splitStartTimeToDateAndTime } from '~/utils/matchDateTimeFields'
+import { MIN_SKELETON_DISPLAY_MS, sleepRemainingAfter } from '~/utils/minimumLoadingDelay'
 import { toYmdLocal } from '~/utils/dateYmd'
 import {
   buildCalendarRoundsFromMatches,
@@ -22,12 +24,16 @@ import {
 import {
   dayLabels,
   eventTypeOptions,
-  formatOptions,
+  formatDateTimeNoSeconds,
+  formatMatchScoreDisplay,
+  isGroupsPlusPlayoffFamily,
+  isMatchEditLocked,
   matchCountLabel,
   statusLabel,
   statusOptions,
   statusPillClass,
   teamSideOptions,
+  tournamentFormatLabel,
 } from '~/utils/tournamentAdminUi'
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import draggable from 'vuedraggable'
@@ -43,7 +49,11 @@ const toast = useToast()
 const tournamentId = computed(() => route.params.id as string)
 const tenantId = useTenantId()
 
-const loading = ref(false)
+/** До первого ответа API — иначе при F5 пустой заголовок и мелькание вкладок. */
+const initialLoading = ref(true)
+/** Повторные запросы списка матчей (фильтры календаря и т.д.). */
+const calendarRefreshing = ref(false)
+let isFirstTournamentFetch = true
 const tournament = ref<TournamentDetails | null>(null)
 
 const tableLoading = ref(false)
@@ -77,11 +87,57 @@ const teamsLoading = ref(false)
 const allTeams = ref<TeamLite[]>([])
 const selectedTeamIds = ref<string[]>([])
 const savingTeams = ref(false)
-const groupA = ref<(TournamentDetails['tournamentTeams'][number])[]>([])
-const groupB = ref<(TournamentDetails['tournamentTeams'][number])[]>([])
+type TournamentTeamRow = TournamentDetails['tournamentTeams'][number]
+type GroupColumn = { id: string; name: string; teams: TournamentTeamRow[] }
+const groupColumns = ref<GroupColumn[]>([])
 const groupingSaving = ref(false)
-const preDragA = ref<string[]>([])
-const preDragB = ref<string[]>([])
+const preDragGroups = ref<Record<string, string[]>>({})
+
+function showGroupBucketsFor(t: TournamentDetails) {
+  const f = t.format
+  if (isGroupsPlusPlayoffFamily(f)) return true
+  if (f === 'MANUAL' && (t.groupCount ?? 1) > 1) return true
+  return false
+}
+
+function initGroupColumns(res: TournamentDetails) {
+  const gs = (res.groups ?? []).slice().sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))
+  const tts = res.tournamentTeams ?? []
+  if (!gs.length) {
+    groupColumns.value = []
+    return
+  }
+  const cols: GroupColumn[] = gs.map((g) => ({
+    id: g.id,
+    name: g.name,
+    teams: [] as TournamentTeamRow[],
+  }))
+  const byId = Object.fromEntries(cols.map((c) => [c.id, c.teams])) as Record<
+    string,
+    TournamentTeamRow[]
+  >
+  const assigned = new Set<string>()
+  for (const tt of tts) {
+    const gid = tt.group?.id
+    if (gid && byId[gid]) {
+      byId[gid].push(tt)
+      assigned.add(tt.teamId)
+    }
+  }
+  const loose = tts.filter((tt) => !assigned.has(tt.teamId))
+  for (let i = 0; i < loose.length; i++) {
+    const col = cols[i % cols.length]
+    if (col) col.teams.push(loose[i]!)
+  }
+  for (const col of cols) {
+    col.teams.sort(
+      (a, b) =>
+        (a.groupSortOrder ?? 0) - (b.groupSortOrder ?? 0) ||
+        a.team.name.localeCompare(b.team.name, 'ru'),
+    )
+  }
+  groupColumns.value = cols
+}
 
 const calendarForm = reactive({
   startDate: null as Date | null,
@@ -172,7 +228,7 @@ const saveRoundOrder = async (r: CalendarRound) => {
   if (!token.value) return
   if (!tournament.value) return
   if (r.dateKey === 'unknown') return
-  if (tournament.value.format !== 'SINGLE_GROUP') return
+  if (!canReorderCalendarDay.value) return
 
   const matchIds = (r.matches ?? []).map((m) => m.id)
   if (!matchIds.length) return
@@ -229,6 +285,9 @@ const protocolAwayPlayerOptions = computed(() =>
   })),
 )
 
+const protocolDate = ref<Date | null>(null)
+const protocolTime = ref<Date | null>(null)
+
 const protocolForm = reactive({
   startTime: null as Date | null,
   homeScore: 0,
@@ -242,9 +301,16 @@ const protocolForm = reactive({
   }[],
 })
 
+const protocolReadOnly = computed(() =>
+  protocolMatch.value ? isMatchEditLocked(protocolMatch.value.status) : false,
+)
+
 const openProtocol = async (m: MatchRow) => {
   protocolMatch.value = m
   protocolForm.startTime = m.startTime ? new Date(m.startTime) : null
+  const sp = splitStartTimeToDateAndTime(protocolForm.startTime)
+  protocolDate.value = sp.date
+  protocolTime.value = sp.time
   protocolForm.homeScore = (m.homeScore ?? 0) as number
   protocolForm.awayScore = (m.awayScore ?? 0) as number
   protocolForm.status = (m.status ?? 'PLAYED') as string
@@ -285,6 +351,10 @@ const openProtocol = async (m: MatchRow) => {
   }
 }
 
+watch([protocolDate, protocolTime], () => {
+  protocolForm.startTime = mergeDateAndTime(protocolDate.value, protocolTime.value)
+})
+
 const addEvent = () => {
   protocolForm.events.push({
     type: 'GOAL',
@@ -300,6 +370,15 @@ const removeEvent = (idx: number) => {
 
 const saveProtocol = async () => {
   if (!token.value || !protocolMatch.value) return
+  if (protocolReadOnly.value) {
+    toast.add({
+      severity: 'info',
+      summary: 'Матч завершён',
+      detail: 'Протокол нельзя изменить.',
+      life: 4000,
+    })
+    return
+  }
   protocolSaving.value = true
   try {
     const desiredStartTime = protocolForm.startTime instanceof Date ? protocolForm.startTime : null
@@ -358,13 +437,19 @@ const saveProtocol = async () => {
 }
 
 const finishProtocol = async () => {
+  if (protocolReadOnly.value) return
   if (protocolForm.status !== 'FINISHED') protocolForm.status = 'FINISHED'
   await saveProtocol()
 }
 
 const fetchTournament = async () => {
-  if (!token.value) return
-  loading.value = true
+  if (!token.value) {
+    initialLoading.value = false
+    return
+  }
+  const loadStartedAt = Date.now()
+  const isInitial = isFirstTournamentFetch
+  if (!isInitial) calendarRefreshing.value = true
   try {
     const params = new URLSearchParams()
     const range = calendarFilterDateRange.value
@@ -408,38 +493,10 @@ const fetchTournament = async () => {
       ? res.tournamentTeams.map((x) => x.teamId)
       : []
 
-    // Init grouping UI: show current group assignment.
-    if (['GROUPS_PLUS_PLAYOFF', 'GROUPS_2', 'GROUPS_3', 'GROUPS_4'].includes(res.format)) {
-      const tts = (res.tournamentTeams ?? []).slice()
-      const orderedTeamGroupIds: string[] = []
-      for (const tt of tts) {
-        const gid = tt.group?.id
-        if (!gid) continue
-        if (!orderedTeamGroupIds.includes(gid)) orderedTeamGroupIds.push(gid)
-      }
-
-      const aId =
-        orderedTeamGroupIds[0] ??
-        (res.groups ?? []).find((g) => g.name === 'Группа A')?.id ??
-        (res.groups ?? [])[0]?.id
-      const bId =
-        orderedTeamGroupIds[1] ??
-        (res.groups ?? []).find((g) => g.name === 'Группа B')?.id ??
-        (res.groups ?? [])[1]?.id
-
-      const a: typeof tts = []
-      const b: typeof tts = []
-      for (const tt of tts) {
-        if (tt.group?.id && aId && tt.group.id === aId) a.push(tt)
-        else if (tt.group?.id && bId && tt.group.id === bId) b.push(tt)
-      }
-      // if not assigned yet, split by order from backend (createdAt asc)
-      if (a.length + b.length !== tts.length) {
-        a.splice(0, a.length, ...tts.filter((_, i) => i % 2 === 0))
-        b.splice(0, b.length, ...tts.filter((_, i) => i % 2 === 1))
-      }
-      groupA.value = a
-      groupB.value = b
+    if (showGroupBucketsFor(res)) {
+      initGroupColumns(res)
+    } else {
+      groupColumns.value = []
     }
   } catch (e: any) {
     toast.add({
@@ -449,7 +506,13 @@ const fetchTournament = async () => {
       life: 6000,
     })
   } finally {
-    loading.value = false
+    await sleepRemainingAfter(MIN_SKELETON_DISPLAY_MS, loadStartedAt)
+    if (isInitial) {
+      isFirstTournamentFetch = false
+      initialLoading.value = false
+    } else {
+      calendarRefreshing.value = false
+    }
   }
 }
 
@@ -470,9 +533,27 @@ const applyCalendarFilters = async () => {
   await fetchTournament()
 }
 
-const isGroupedFormat = computed(() =>
-  ['GROUPS_PLUS_PLAYOFF', 'GROUPS_2', 'GROUPS_3', 'GROUPS_4'].includes(tournament.value?.format ?? ''),
+/** Таблица по группам: групповые форматы + MANUAL с несколькими группами (см. ensureManualGroupsIfNeeded на бэкенде). */
+const isGroupedFormat = computed(() => {
+  const t = tournament.value
+  if (!t) return false
+  if (isGroupsPlusPlayoffFamily(t.format)) return true
+  if (t.format === 'MANUAL' && (t.groupCount ?? 1) > 1) return true
+  return false
+})
+
+const isManualFormat = computed(() => tournament.value?.format === 'MANUAL')
+const isPlayoffOnlyFormat = computed(() => tournament.value?.format === 'PLAYOFF')
+
+const showGroupBuckets = computed(() =>
+  tournament.value ? showGroupBucketsFor(tournament.value) : false,
 )
+
+/** Перетаскивание порядка в дне как для круговой одной группы, так и для полностью ручного расписания. */
+const canReorderCalendarDay = computed(() => {
+  const f = tournament.value?.format
+  return f === 'SINGLE_GROUP' || f === 'MANUAL'
+})
 const hasAnyEnteredResults = computed(() => {
   const ms = tournament.value?.matches ?? []
   return ms.some((m) => m.homeScore !== null && m.awayScore !== null && (m.status === 'PLAYED' || m.status === 'FINISHED'))
@@ -482,7 +563,10 @@ const canEditTournament = computed(() => tournament.value?.status === 'DRAFT')
 
 // Группы можно менять, пока в расписании нет введённых результатов.
 // После ввода хотя бы одного счёта правки групп могут сломать календарь и таблицы.
-const canEditGroups = computed(() => isGroupedFormat.value && canEditTournament.value && !hasAnyEnteredResults.value)
+const canEditGroups = computed(
+  () =>
+    showGroupBuckets.value && canEditTournament.value && !hasAnyEnteredResults.value,
+)
 
 const canEditTeams = computed(() => canEditTournament.value && !hasAnyEnteredResults.value)
 
@@ -496,7 +580,11 @@ const teamCount = computed(() => tournament.value?.tournamentTeams?.length ?? 0)
 
 const canRegenerateCalendar = computed(() => {
   const minTeams = tournament.value?.minTeams ?? 0
-  return shouldRegenerateCalendar.value && teamCount.value >= minTeams
+  return (
+    shouldRegenerateCalendar.value &&
+    teamCount.value >= minTeams &&
+    !isManualFormat.value
+  )
 })
 
 const ratingSaving = ref(false)
@@ -539,11 +627,12 @@ const updateTeamRating = async (teamId: string, rating: number) => {
 
 const expectedGroupCount = computed(() => {
   const f = tournament.value?.format
+  const t = tournament.value
   if (f === 'GROUPS_2') return 2
   if (f === 'GROUPS_3') return 3
   if (f === 'GROUPS_4') return 4
-  if (f === 'GROUPS_PLUS_PLAYOFF') return 2
-  return tournament.value?.groupCount ?? 1
+  if (f === 'GROUPS_PLUS_PLAYOFF') return t?.groupCount ?? 2
+  return t?.groupCount ?? 1
 })
 
 const expectedGroupSize = computed(() => {
@@ -631,6 +720,7 @@ const playoffSupportedFormats = [
   'GROUPS_2',
   'GROUPS_3',
   'GROUPS_4',
+  'MANUAL',
 ]
 
 const playoffQualifiersPerGroup = computed(() => tournament.value?.playoffQualifiersPerGroup ?? 2)
@@ -766,41 +856,87 @@ const playoffSlotLabels = (m: MatchRow) => {
   return { home: homeTeam, away: awayTeam }
 }
 
-const saveTeamGroup = async (teamId: string, groupId: string | null) => {
-  if (!token.value) return
+/** Полная синхронизация групп и порядка в колонках (groupSortOrder на бэкенде). */
+const syncGroupLayoutFromColumns = async () => {
+  if (!token.value || !tournament.value) return
+  const items: { teamId: string; groupId: string; groupSortOrder: number }[] = []
+  for (const col of groupColumns.value) {
+    col.teams.forEach((t, i) => {
+      items.push({ teamId: t.teamId, groupId: col.id, groupSortOrder: i })
+    })
+  }
+  if (!items.length) return
   groupingSaving.value = true
   try {
-    await authFetch(apiUrl(`/tournaments/${tournamentId.value}/teams/${teamId}/group`), {
-      method: 'PATCH',
+    await authFetch(apiUrl(`/tournaments/${tournamentId.value}/teams/group-layout`), {
+      method: 'PUT',
       headers: { Authorization: `Bearer ${token.value}` },
-      body: { groupId },
+      body: { items },
     })
   } finally {
     groupingSaving.value = false
   }
 }
 
+/** При равном делении (expectedGroupSize) не даём переполнить группу; обмен — только между «полными» списками. */
 const checkGroupMove = (evt: any) => {
   if (!canEditGroups.value || groupingSaving.value) return false
-  return true
+  const size = expectedGroupSize.value
+  if (!size) return true
+  const relatedContext = evt?.relatedContext
+  const draggedContext = evt?.draggedContext
+  // Если vuedraggable не передал list, не блокируем — иначе нельзя исправить уже «сломанный» состав; баланс ловим в onGroupChange.
+  if (!relatedContext?.list || !draggedContext?.list) return true
+  const destList = relatedContext.list as TournamentTeamRow[]
+  const srcList = draggedContext.list as TournamentTeamRow[]
+  if (destList === srcList) return true
+  const destLen = destList.length
+  const srcLen = srcList.length
+  if (destLen < size) return true
+  if (destLen === size && srcLen === size) return true
+  return false
+}
+
+function ruTeamsNom(n: number): string {
+  const nn = Math.floor(Math.abs(n)) % 100
+  const n10 = nn % 10
+  if (n10 === 1 && nn !== 11) return 'команда'
+  if (n10 >= 2 && n10 <= 4 && (nn < 12 || nn > 14)) return 'команды'
+  return 'команд'
+}
+
+function ruGroupsNom(n: number): string {
+  const nn = Math.floor(Math.abs(n)) % 100
+  const n10 = nn % 10
+  if (n10 === 1 && nn !== 11) return 'группа'
+  if (n10 >= 2 && n10 <= 4 && (nn < 12 || nn > 14)) return 'группы'
+  return 'групп'
+}
+
+const snapshotPreDrag = () => {
+  preDragGroups.value = Object.fromEntries(
+    groupColumns.value.map((c) => [c.id, c.teams.map((t) => t.teamId)]),
+  )
 }
 
 const onGroupChange = async (evt: any, targetGroupId: string | null) => {
   if (!canEditGroups.value || !tournament.value) return
   if (!targetGroupId) return
-  const moved = (evt?.added?.element ?? evt?.moved?.element) as any | undefined
+  const moved = (evt?.added?.element ?? evt?.moved?.element) as TournamentTeamRow | undefined
   if (!moved) return
   const newIndex = (evt?.added?.newIndex ?? evt?.moved?.newIndex) as number | undefined
   const size = expectedGroupSize.value
+  const cols = groupColumns.value
+  let swapped: TournamentTeamRow | null = null
 
-  // If target overflowed, perform a swap by moving one item back to the source.
-  let swapped: any | null = null
-  if (size && (groupA.value.length > size || groupB.value.length > size)) {
-    const isTargetA = targetGroupId === groupIdA.value
-    const targetList = isTargetA ? groupA.value : groupB.value
-    const sourceList = isTargetA ? groupB.value : groupA.value
-    const preTarget = isTargetA ? preDragA.value : preDragB.value
-    const preSource = isTargetA ? preDragB.value : preDragA.value
+  if (size && cols.length === 2 && (cols[0].teams.length > size || cols[1].teams.length > size)) {
+    const c0 = cols[0]
+    const c1 = cols[1]
+    const isTargetA = targetGroupId === c0.id
+    const targetList = isTargetA ? c0.teams : c1.teams
+    const sourceList = isTargetA ? c1.teams : c0.teams
+    const preTarget = isTargetA ? preDragGroups.value[c0.id] ?? [] : preDragGroups.value[c1.id] ?? []
+    const preSource = isTargetA ? preDragGroups.value[c1.id] ?? [] : preDragGroups.value[c0.id] ?? []
 
     const swapOutId =
       typeof newIndex === 'number' && newIndex >= 0 && newIndex < preTarget.length
@@ -809,7 +945,7 @@ const onGroupChange = async (evt: any, targetGroupId: string | null) => {
 
     const pickSwapOut = () => {
       if (swapOutId && swapOutId !== moved.teamId) {
-        const found = targetList.find((x: any) => x.teamId === swapOutId)
+        const found = targetList.find((x) => x.teamId === swapOutId)
         if (found) return found
       }
       for (let i = targetList.length - 1; i >= 0; i--) {
@@ -820,7 +956,7 @@ const onGroupChange = async (evt: any, targetGroupId: string | null) => {
 
     swapped = pickSwapOut()
     if (swapped) {
-      const idx = targetList.findIndex((x: any) => x.teamId === swapped.teamId)
+      const idx = targetList.findIndex((x) => x.teamId === swapped.teamId)
       if (idx >= 0) targetList.splice(idx, 1)
 
       const desiredIndex = preSource.indexOf(moved.teamId)
@@ -828,20 +964,29 @@ const onGroupChange = async (evt: any, targetGroupId: string | null) => {
       sourceList.splice(insertAt, 0, swapped)
     }
   }
-  try {
-    const ops: Promise<any>[] = [saveTeamGroup(moved.teamId, targetGroupId)]
-    if (swapped) {
-      const otherGroupId = targetGroupId === groupIdA.value ? groupIdB.value : groupIdA.value
-      if (otherGroupId) ops.push(saveTeamGroup(swapped.teamId, otherGroupId))
+
+  if (size && cols.length === 2) {
+    const a = cols[0].teams.length
+    const b = cols[1].teams.length
+    if (a !== size || b !== size) {
+      await fetchTournament()
+      toast.add({
+        severity: 'warn',
+        summary: 'Ровное распределение',
+        detail: `При ${tournament.value?.tournamentTeams?.length ?? 0} командах и ${cols.length} группах в каждой должно быть ровно ${size}. Перетащите обменом или отмените действие.`,
+        life: 6000,
+      })
+      return
     }
-    await Promise.all(ops)
+  }
+
+  try {
+    await syncGroupLayoutFromColumns()
     await fetchTournament()
 
     if (canRegenerateCalendar.value) {
-      // Пересоздаём календарь, чтобы расписание матчей соответствовало новым группам.
       await generateCalendar()
       await fetchTournament()
-      await fetchTable()
       toast.add({
         severity: 'success',
         summary: 'Группы обновлены',
@@ -856,6 +1001,9 @@ const onGroupChange = async (evt: any, targetGroupId: string | null) => {
           swapped ? 'Команды поменялись местами.' : 'Команда перемещена.' + (teamCount.value < (tournament.value?.minTeams ?? 0) ? ' Календарь не пересоздан: недостаточно команд.' : ''),
         life: 1500,
       })
+    }
+    if (isGroupedFormat.value) {
+      await fetchTable()
     }
   } catch (e: any) {
     toast.add({ severity: 'error', summary: 'Не удалось сохранить группы', detail: getApiErrorMessage(e, 'Ошибка запроса'), life: 6000 })
@@ -997,6 +1145,15 @@ const isValidTimeHHmm = (s: unknown) => typeof s === 'string' && /^([01]\d|2[0-3
 
 const generateCalendar = async () => {
   if (!token.value) return
+  if (tournament.value?.format === 'MANUAL') {
+    toast.add({
+      severity: 'warn',
+      summary: 'Автогенерация недоступна',
+      detail: 'Для формата «только ручное расписание» календарь не генерируется автоматически.',
+      life: 4000,
+    })
+    return
+  }
   calendarSaving.value = true
   try {
     const templateEnabled =
@@ -1124,6 +1281,14 @@ const clearCalendar = async () => {
   }
 }
 
+/** MANUAL с несколькими группами: сетка плей-офф строится по таблицам групп (тот же API, что и для GROUPS_*). */
+const canGenerateManualPlayoff = computed(
+  () =>
+    isManualFormat.value &&
+    isGroupedFormat.value &&
+    (tournament.value?.groups?.length ?? 0) >= 2,
+)
+
 const generatePlayoff = async () => {
   if (!token.value) return
   calendarSaving.value = true
@@ -1151,10 +1316,79 @@ const generatePlayoff = async () => {
   }
 }
 
+const canManageManualMatches = computed(
+  () =>
+    isManualFormat.value &&
+    !!token.value &&
+    tournament.value?.status !== 'ARCHIVED' &&
+    (tournament.value?.tournamentTeams?.length ?? 0) >= 2,
+)
+
+const matchesWorkspaceRef = ref<{
+  openManualMatchDialog: () => void
+} | null>(null)
+
+const onMatchesWorkspaceUpdated = async () => {
+  await fetchTournament()
+  await fetchTable()
+}
+
+const deletingMatchId = ref<string | null>(null)
+
+const deleteManualMatchConfirmOpen = ref(false)
+const manualMatchToDelete = ref<MatchRow | null>(null)
+const deleteManualMatchMessage =
+  'Удалить этот матч из турнира? Таблица и календарь обновятся.'
+
+function requestDeleteManualMatch(m: MatchRow) {
+  if (!token.value) return
+  if (isMatchEditLocked(m.status)) {
+    toast.add({
+      severity: 'info',
+      summary: 'Матч завершён',
+      detail: 'Нельзя удалить завершённый матч.',
+      life: 4000,
+    })
+    return
+  }
+  manualMatchToDelete.value = m
+  deleteManualMatchConfirmOpen.value = true
+}
+
+async function confirmDeleteManualMatch() {
+  const m = manualMatchToDelete.value
+  if (!token.value || !m) return
+  deletingMatchId.value = m.id
+  try {
+    await authFetch(apiUrl(`/tournaments/${tournamentId.value}/matches/${m.id}`), {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token.value}` },
+    })
+    await fetchTournament()
+    await fetchTable()
+    toast.add({
+      severity: 'success',
+      summary: 'Матч удалён',
+      life: 2500,
+    })
+  } catch (e: unknown) {
+    toast.add({
+      severity: 'error',
+      summary: 'Не удалось удалить матч',
+      detail: getApiErrorMessage(e, 'Ошибка запроса'),
+      life: 6000,
+    })
+  } finally {
+    deletingMatchId.value = null
+    manualMatchToDelete.value = null
+  }
+}
+
 onMounted(async () => {
   if (typeof window !== 'undefined') {
     syncWithStorage()
     if (!loggedIn.value) {
+      initialLoading.value = false
       router.push('/admin/login')
       return
     }
@@ -1166,7 +1400,86 @@ onMounted(async () => {
 </script>
 
 <template>
-  <section class="p-6 space-y-6">
+  <section
+    v-if="initialLoading"
+    class="p-6 space-y-6 min-h-[28rem]"
+    aria-busy="true"
+  >
+    <div class="flex items-start justify-between gap-4">
+      <div class="space-y-3 min-w-0 flex-1">
+        <Skeleton width="5rem" height="2.25rem" class="rounded-md" />
+        <Skeleton width="85%" height="2rem" class="rounded-md max-w-md" />
+        <Skeleton width="10rem" height="1rem" class="rounded-md" />
+      </div>
+      <Skeleton width="11rem" height="2.5rem" class="rounded-md shrink-0" />
+    </div>
+    <div class="flex flex-wrap gap-2">
+      <Skeleton width="7rem" height="2.5rem" class="rounded-md" />
+      <Skeleton width="6rem" height="2.5rem" class="rounded-md" />
+      <Skeleton width="7rem" height="2.5rem" class="rounded-md" />
+    </div>
+    <div
+      class="rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-4 space-y-4"
+    >
+      <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div class="space-y-2 flex-1">
+          <Skeleton width="11rem" height="1rem" class="rounded-md" />
+          <Skeleton width="90%" height="0.75rem" class="rounded-md" />
+        </div>
+        <Skeleton width="9rem" height="2.25rem" class="rounded-md shrink-0" />
+      </div>
+      <div class="space-y-3">
+        <div class="flex flex-wrap justify-between gap-3">
+          <div class="flex gap-2">
+            <Skeleton width="6.5rem" height="2.25rem" class="rounded-md" />
+            <Skeleton width="5.5rem" height="2.25rem" class="rounded-md" />
+          </div>
+          <div class="flex gap-2">
+            <Skeleton width="8rem" height="2rem" class="rounded-md" />
+            <Skeleton width="7rem" height="2.25rem" class="rounded-md" />
+          </div>
+        </div>
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-12">
+          <div class="md:col-span-6 space-y-2">
+            <Skeleton width="6rem" height="0.75rem" />
+            <Skeleton width="100%" height="2.75rem" class="rounded-md" />
+          </div>
+          <div class="md:col-span-3 space-y-2">
+            <Skeleton width="4rem" height="0.75rem" />
+            <Skeleton width="100%" height="2.75rem" class="rounded-md" />
+          </div>
+          <div class="md:col-span-3 space-y-2">
+            <Skeleton width="4.5rem" height="0.75rem" />
+            <Skeleton width="100%" height="2.75rem" class="rounded-md" />
+          </div>
+        </div>
+        <div
+          v-for="sk in [1, 2, 3]"
+          :key="`cal-full-sk-${sk}`"
+          class="rounded-lg border border-surface-200 dark:border-surface-700 overflow-hidden"
+        >
+          <div class="px-3 py-2 bg-surface-50 dark:bg-surface-800/80">
+            <Skeleton width="55%" height="1rem" class="rounded-md" />
+          </div>
+          <div class="divide-y divide-surface-200 dark:divide-surface-700">
+            <div
+              v-for="j in [1, 2]"
+              :key="`cal-full-sk-${sk}-${j}`"
+              class="flex gap-2 px-3 py-3"
+            >
+              <Skeleton shape="circle" width="2.5rem" height="2.5rem" />
+              <div class="flex-1 space-y-2 min-w-0">
+                <Skeleton width="75%" height="1rem" class="rounded-md" />
+                <Skeleton width="40%" height="0.75rem" class="rounded-md" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section v-else class="p-6 space-y-6">
     <div class="flex items-start justify-between gap-4">
       <div>
         <Button
@@ -1176,7 +1489,7 @@ onMounted(async () => {
           class="mb-2"
           @click="router.push('/admin/tournaments')"
         />
-        <h1 class="text-2xl font-semibold text-surface-900">
+        <h1 class="text-2xl font-semibold text-surface-900 dark:text-surface-0">
           {{ tournament?.name ?? 'Турнир' }}
         </h1>
         <p class="mt-1 text-sm text-muted-color">/{{ tournament?.slug }}</p>
@@ -1184,13 +1497,7 @@ onMounted(async () => {
 
       <div class="flex gap-2">
         <Button
-          label="Сгенерировать календарь"
-          icon="pi pi-calendar-plus"
-          severity="secondary"
-          :disabled="!tournament"
-          @click="calendarDialog = true"
-        />
-        <Button
+          v-if="!isPlayoffOnlyFormat"
           label="Обновить таблицу"
           icon="pi pi-refresh"
           :loading="tableLoading"
@@ -1202,15 +1509,32 @@ onMounted(async () => {
 
     <TabView :activeIndex="activeTab" @update:activeIndex="(v) => (activeTab = v)">
       <TabPanel header="Календарь">
-        <div class="rounded-xl border border-surface-200 bg-surface-0 p-4">
+        <div class="rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-4">
+          <div
+            v-if="isManualFormat"
+            class="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between rounded-lg border border-surface-200 dark:border-surface-600 bg-surface-50 dark:bg-surface-900 px-3 py-2"
+          >
+            <p class="text-sm text-muted-color">
+              Ручное расписание: автогенерация отключена. Добавляйте матчи кнопкой справа (нужно минимум 2 команды в составе).
+            </p>
+            <Button
+              v-if="canManageManualMatches"
+              label="Добавить матч"
+              icon="pi pi-plus"
+              size="small"
+              class="shrink-0"
+              @click="() => matchesWorkspaceRef?.openManualMatchDialog()"
+            />
+          </div>
           <div class="flex items-center justify-between gap-3">
             <div>
-              <h2 class="text-sm font-semibold text-surface-900">Турнирные туры</h2>
+              <h2 class="text-sm font-semibold text-surface-900 dark:text-surface-0">Турнирные туры</h2>
               <p class="mt-1 text-xs text-muted-color">
                 Нажми на матч, чтобы ввести протокол (счёт и события).
               </p>
             </div>
             <Button
+              v-if="!isManualFormat"
               label="Сгенерировать"
               icon="pi pi-calendar-plus"
               severity="secondary"
@@ -1254,7 +1578,7 @@ onMounted(async () => {
 
             <div class="grid grid-cols-1 gap-3 md:grid-cols-12">
               <div class="md:col-span-6">
-                <label class="text-sm block mb-1">Диапазон дат</label>
+                <label class="text-sm block mb-1 text-surface-900 dark:text-surface-100">Диапазон дат</label>
                 <DatePicker
                   v-model="calendarFilterDateRange"
                   class="w-full"
@@ -1264,7 +1588,7 @@ onMounted(async () => {
                 />
               </div>
               <div class="md:col-span-3">
-                <label class="text-sm block mb-1">Статус</label>
+                <label class="text-sm block mb-1 text-surface-900 dark:text-surface-100">Статус</label>
                 <MultiSelect
                   v-model="calendarFilterStatuses"
                   :options="statusOptions"
@@ -1279,7 +1603,7 @@ onMounted(async () => {
                 />
               </div>
               <div class="md:col-span-3">
-                <label class="text-sm block mb-1">Команда</label>
+                <label class="text-sm block mb-1 text-surface-900 dark:text-surface-100">Команда</label>
                 <MultiSelect
                   v-model="calendarFilterTeamIds"
                   :options="allTeams"
@@ -1296,6 +1620,32 @@ onMounted(async () => {
               </div>
             </div>
 
+            <div v-if="calendarRefreshing" class="space-y-4" aria-busy="true">
+              <div
+                v-for="sk in [1, 2, 3]"
+                :key="`cal-refresh-sk-${sk}`"
+                class="rounded-lg border border-surface-200 dark:border-surface-700 overflow-hidden"
+              >
+                <div class="px-3 py-2 bg-surface-50 dark:bg-surface-800/80">
+                  <Skeleton width="55%" height="1rem" class="rounded-md" />
+                </div>
+                <div class="divide-y divide-surface-200 dark:divide-surface-700">
+                  <div
+                    v-for="j in [1, 2]"
+                    :key="`cal-refresh-sk-${sk}-${j}`"
+                    class="flex gap-2 px-3 py-3"
+                  >
+                    <Skeleton shape="circle" width="2.5rem" height="2.5rem" />
+                    <div class="flex-1 space-y-2 min-w-0">
+                      <Skeleton width="75%" height="1rem" class="rounded-md" />
+                      <Skeleton width="40%" height="0.75rem" class="rounded-md" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <template v-else>
             <div v-if="calendarViewMode === 'grouped'">
               <div v-if="!visibleCalendarRounds.length" class="text-sm text-muted-color">
                 Пока нет матчей (с учётом фильтров).
@@ -1305,13 +1655,13 @@ onMounted(async () => {
                 <div
                   v-for="r in visibleCalendarRounds"
                   :key="r.dateKey"
-                  class="rounded-lg border border-surface-200"
+                  class="rounded-lg border border-surface-200 dark:border-surface-700"
                 >
-                  <div class="flex items-center justify-between px-3 py-2 bg-surface-50">
-                    <div class="text-sm font-medium">
+                  <div class="flex items-center justify-between px-3 py-2 bg-surface-50 dark:bg-surface-800/80">
+                    <div class="text-sm font-medium text-surface-900 dark:text-surface-100">
                   {{ displayedRoundTitle(r) }} <span class="text-muted-color">({{ r.dateLabel }})</span>
                       <span
-                        v-if="tournament?.format === 'SINGLE_GROUP'"
+                        v-if="canReorderCalendarDay"
                         class="ml-2 text-xs font-normal text-muted-color"
                       >
                         Перетащи строку, чтобы поменять порядок
@@ -1331,19 +1681,19 @@ onMounted(async () => {
                     handle=".drag-handle"
                     :disabled="
                       !tournament ||
-                      tournament.format !== 'SINGLE_GROUP' ||
+                      !canReorderCalendarDay ||
                       reordering === r.dateKey ||
                       calendarFiltersActive
                     "
-                    class="divide-y divide-surface-200"
+                    class="divide-y divide-surface-200 dark:divide-surface-700"
                     @end="saveRoundOrder(r)"
                   >
                     <template #item="{ element: m }">
-                      <div class="flex items-stretch gap-2 px-3 py-2 hover:bg-surface-50 transition-colors">
+                      <div class="flex items-stretch gap-2 px-3 py-2 hover:bg-surface-50 dark:hover:bg-surface-800/50 transition-colors">
                         <button
                           type="button"
-                          class="drag-handle flex items-center justify-center w-10 text-muted-color hover:text-surface-900 cursor-grab active:cursor-grabbing"
-                          :title="tournament?.format === 'SINGLE_GROUP' ? 'Перетащить' : 'Недоступно для формата'"
+                          class="drag-handle flex items-center justify-center w-10 text-muted-color hover:text-surface-900 dark:hover:text-surface-100 cursor-grab active:cursor-grabbing"
+                          :title="canReorderCalendarDay ? 'Перетащить' : 'Недоступно для формата'"
                         >
                           <div class="flex items-center gap-2">
                             <span class="pi pi-bars text-sm" />
@@ -1355,11 +1705,11 @@ onMounted(async () => {
 
                         <button
                           type="button"
-                          class="flex-1 text-left"
+                          class="min-w-0 flex-1 text-left"
                           @click="openProtocol(m)"
                         >
                           <div class="flex items-center justify-between gap-3">
-                            <div class="text-sm">
+                            <div class="text-sm text-surface-900 dark:text-surface-100">
                               <span class="font-medium">
                                 {{ playoffSlotLabels(m)?.home ?? m.homeTeam.name }}
                               </span>
@@ -1370,18 +1720,31 @@ onMounted(async () => {
                                 {{ playoffSlotLabels(m)?.away ?? m.awayTeam.name }}
                               </span>
                             </div>
-                            <div class="text-sm tabular-nums">
+                            <div class="text-sm tabular-nums text-surface-900 dark:text-surface-100">
                               <span v-if="m.homeScore !== null && m.awayScore !== null">
-                                {{ m.homeScore }}:{{ m.awayScore }}
+                                {{ formatMatchScoreDisplay(m) }}
                               </span>
                               <span v-else class="text-muted-color">—</span>
                             </div>
                           </div>
                           <div class="mt-1 text-xs text-muted-color">
-                            {{ new Date(m.startTime).toLocaleString() }} ·
+                            {{ formatDateTimeNoSeconds(m.startTime) }} ·
                             <span :class="statusPillClass(m.status)">{{ statusLabel(m.status) }}</span>
                           </div>
                         </button>
+                        <Button
+                          v-if="canManageManualMatches"
+                          type="button"
+                          icon="pi pi-trash"
+                          severity="danger"
+                          text
+                          rounded
+                          class="shrink-0 self-center"
+                          :disabled="isMatchEditLocked(m.status)"
+                          :loading="deletingMatchId === m.id"
+                          aria-label="Удалить матч"
+                          @click.stop="requestDeleteManualMatch(m)"
+                        />
                       </div>
                     </template>
                   </draggable>
@@ -1398,10 +1761,10 @@ onMounted(async () => {
                 <div
                   v-for="t in visibleTourSections"
                   :key="t.key"
-                  class="rounded-lg border border-surface-200"
+                  class="rounded-lg border border-surface-200 dark:border-surface-700"
                 >
-                  <div class="flex items-center justify-between px-3 py-2 bg-surface-50">
-                    <div class="text-sm font-medium">
+                  <div class="flex items-center justify-between px-3 py-2 bg-surface-50 dark:bg-surface-800/80">
+                    <div class="text-sm font-medium text-surface-900 dark:text-surface-100">
                       {{ t.title }} <span class="text-muted-color">({{ t.dateLabel }})</span>
                     </div>
                     <div class="text-xs text-muted-color flex items-center gap-2">
@@ -1416,19 +1779,19 @@ onMounted(async () => {
                     </div>
                   </div>
 
-                  <div v-if="expandedTourKeys[t.key]" class="divide-y divide-surface-200">
+                  <div v-if="expandedTourKeys[t.key]" class="divide-y divide-surface-200 dark:divide-surface-700">
                     <div
                       v-for="m in t.matches"
                       :key="m.id"
-                      class="flex items-stretch gap-2 px-3 py-2 hover:bg-surface-50 transition-colors"
+                      class="flex items-stretch gap-2 px-3 py-2 hover:bg-surface-50 dark:hover:bg-surface-800/50 transition-colors"
                     >
                       <button
                         type="button"
-                        class="flex-1 text-left"
+                        class="min-w-0 flex-1 text-left"
                         @click="openProtocol(m)"
                       >
                         <div class="flex items-center justify-between gap-3">
-                          <div class="text-sm">
+                          <div class="text-sm text-surface-900 dark:text-surface-100">
                             <span class="font-medium">
                               {{ playoffSlotLabels(m)?.home ?? m.homeTeam.name }}
                             </span>
@@ -1439,32 +1802,79 @@ onMounted(async () => {
                               {{ playoffSlotLabels(m)?.away ?? m.awayTeam.name }}
                             </span>
                           </div>
-                          <div class="text-sm tabular-nums">
+                          <div class="text-sm tabular-nums text-surface-900 dark:text-surface-100">
                             <span v-if="m.homeScore !== null && m.awayScore !== null">
-                              {{ m.homeScore }}:{{ m.awayScore }}
+                              {{ formatMatchScoreDisplay(m) }}
                             </span>
                             <span v-else class="text-muted-color">—</span>
                           </div>
                         </div>
                         <div class="mt-1 text-xs text-muted-color">
-                          {{ new Date(m.startTime).toLocaleString() }} ·
+                          {{ formatDateTimeNoSeconds(m.startTime) }} ·
                           <span :class="statusPillClass(m.status)">{{ statusLabel(m.status) }}</span>
                         </div>
                       </button>
+                      <Button
+                        v-if="canManageManualMatches"
+                        type="button"
+                        icon="pi pi-trash"
+                        severity="danger"
+                        text
+                        rounded
+                        class="shrink-0 self-center"
+                        :disabled="isMatchEditLocked(m.status)"
+                        :loading="deletingMatchId === m.id"
+                        aria-label="Удалить матч"
+                        @click.stop="requestDeleteManualMatch(m)"
+                      />
                     </div>
                   </div>
                 </div>
               </div>
             </div>
+            </template>
           </div>
         </div>
       </TabPanel>
 
-      <TabPanel header="Таблица">
-        <div class="rounded-xl border border-surface-200 bg-surface-0 p-4">
+      <TabPanel header="Матчи">
+        <div
+          v-if="canGenerateManualPlayoff"
+          class="mb-4 rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-50 dark:bg-surface-800/50 p-4"
+        >
+          <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div class="text-sm">
+              <span class="font-medium text-surface-900 dark:text-surface-0">Плей-офф по итогам групп</span>
+              <p class="mt-1 text-xs text-muted-color">
+                После того как все групповые матчи сыграны и внесены в протокол, можно сгенерировать сетку на вылет по
+                очкам и доп. критериям (как в автоформатах). Число выходов из группы задаётся в настройках турнира.
+              </p>
+            </div>
+            <Button
+              label="Сгенерировать плей-офф"
+              icon="pi pi-sitemap"
+              severity="secondary"
+              :loading="calendarSaving"
+              class="shrink-0"
+              @click="generatePlayoff"
+            />
+          </div>
+        </div>
+        <AdminTournamentMatchesWorkspace
+          ref="matchesWorkspaceRef"
+          embedded
+          :tournament-id="tournamentId"
+          :tournament="tournament"
+          :external-open-protocol="openProtocol"
+          @updated="onMatchesWorkspaceUpdated"
+        />
+      </TabPanel>
+
+      <TabPanel v-if="!isPlayoffOnlyFormat" header="Таблица">
+        <div class="rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-4">
           <div class="flex items-center justify-between">
             <div>
-              <h2 class="text-sm font-semibold text-surface-900">Турнирная таблица</h2>
+              <h2 class="text-sm font-semibold text-surface-900 dark:text-surface-0">Турнирная таблица</h2>
               <p class="mt-1 text-xs text-muted-color">Автообновляется после сохранения протокола.</p>
             </div>
             <Button
@@ -1481,7 +1891,7 @@ onMounted(async () => {
               v-for="g in (tournament?.groups ?? []).slice().sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0))"
               :key="g.id"
             >
-              <div class="text-sm font-semibold text-surface-900">{{ g.name }}</div>
+              <div class="text-sm font-semibold text-surface-900 dark:text-surface-0">{{ g.name }}</div>
               <DataTable
                 :value="groupTables[g.id] ?? []"
                 :loading="tableLoading"
@@ -1533,9 +1943,9 @@ onMounted(async () => {
 
       <TabPanel header="Составы">
         <div class="grid gap-4 lg:grid-cols-3">
-          <div class="rounded-xl border border-surface-200 bg-surface-0 p-4 lg:col-span-2">
+          <div class="rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-4 lg:col-span-2">
             <div class="flex items-center justify-between">
-              <h2 class="text-sm font-semibold text-surface-900">Команды турнира</h2>
+              <h2 class="text-sm font-semibold text-surface-900 dark:text-surface-0">Команды турнира</h2>
               <div class="text-xs text-muted-color">
                 {{ tournament?.tournamentTeams?.length ?? 0 }} / {{ tournament?.minTeams ?? 0 }}
               </div>
@@ -1564,86 +1974,73 @@ onMounted(async () => {
               />
             </div>
 
-            <div v-if="isGroupedFormat" class="mt-4">
-              <div class="text-sm font-semibold text-surface-900">Группы</div>
-              <div class="mt-1 text-xs text-muted-color">
-                Перетаскивай команды между группами. После генерации календаря распределение будет доступно,
-                пока не введены результаты (счёт в матчах). Правки доступны только для черновика.
+            <div v-if="showGroupBuckets" class="mt-4">
+              <div class="text-sm font-semibold text-surface-900 dark:text-surface-0">Группы</div>
+              <div class="mt-1 text-xs text-muted-color space-y-1">
+                <p v-if="isManualFormat">
+                  Число групп задаётся в «Редактировать турнир» (поле «Кол-во групп», 2–8). Распределите команды по
+                  колонкам; при равном делении показывается «ожидается по N команд» в группе. Сколько команд выходит
+                  из группы дальше — поле «Команд выходит из группы» в карточке турнира.
+                </p>
+                <p v-else>
+                  Перетаскивай команды между группами. После генерации календаря распределение будет доступно, пока не
+                  введены результаты (счёт в матчах). Правки доступны только для черновика.
+                </p>
+              </div>
+              <div
+                v-if="expectedGroupSize"
+                class="mt-2 text-xs font-medium text-surface-700 dark:text-surface-200"
+              >
+                По {{ expectedGroupSize }} {{ ruTeamsNom(expectedGroupSize) }} в каждой группе при текущем составе
+                ({{ tournament?.tournamentTeams?.length ?? 0 }}
+                {{ ruTeamsNom(tournament?.tournamentTeams?.length ?? 0) }}, {{ tournament?.groupCount ?? 1 }}
+                {{ ruGroupsNom(tournament?.groupCount ?? 1) }}).
               </div>
 
-              <div class="mt-3 grid gap-3 md:grid-cols-2">
-                <div class="rounded-lg border border-surface-200 p-3">
-                  <div class="flex items-center justify-between">
-                    <div class="text-sm font-medium">Группа A</div>
-                    <div class="text-xs text-muted-color">{{ groupA.length }}</div>
+              <div
+                class="mt-3 grid gap-3"
+                :class="{
+                  'md:grid-cols-2': groupColumns.length <= 2,
+                  'md:grid-cols-2 lg:grid-cols-3': groupColumns.length === 3,
+                  'md:grid-cols-2 lg:grid-cols-4': groupColumns.length >= 4,
+                }"
+              >
+                <div
+                  v-for="col in groupColumns"
+                  :key="col.id"
+                  class="rounded-lg border border-surface-200 dark:border-surface-700 p-3 min-w-0"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <div class="text-sm font-medium truncate">{{ col.name }}</div>
+                    <div class="text-xs text-muted-color shrink-0">{{ col.teams.length }}</div>
                   </div>
                   <draggable
-                    :list="groupA"
+                    :list="col.teams"
                     item-key="teamId"
                     group="teams-groups"
                     handle=".drag-handle"
                     :disabled="!canEditGroups || groupingSaving"
                     :move="checkGroupMove"
                     class="mt-2 space-y-2"
-                    @start="() => { preDragA.value = groupA.map((x) => x.teamId); preDragB.value = groupB.map((x) => x.teamId) }"
-                    @change="(e) => onGroupChange(e, groupIdA)"
+                    @start="snapshotPreDrag"
+                    @change="(e: any) => onGroupChange(e, col.id)"
                   >
                     <template #item="{ element: tt }">
-                      <div class="flex items-center justify-between rounded-md border border-surface-200 px-3 py-2">
-                        <div class="flex items-center gap-2">
+                      <div class="flex items-center justify-between rounded-md border border-surface-200 dark:border-surface-700 px-3 py-2">
+                        <div class="flex items-center gap-2 min-w-0">
                           <span
-                            class="drag-handle pi pi-bars text-muted-color"
+                            class="drag-handle pi pi-bars text-muted-color shrink-0"
                             :class="canEditGroups ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed opacity-50'"
                             :title="canEditGroups ? 'Перетащить' : 'Недоступно после генерации'"
                           />
-                          <div class="text-sm">{{ tt.team.name }}</div>
+                          <div class="text-sm truncate">{{ tt.team.name }}</div>
                         </div>
                         <Select
                           :modelValue="tt.rating ?? 3"
                           :options="ratingOptions"
                           optionLabel="label"
                           optionValue="value"
-                          class="w-20"
-                          :disabled="!canEditTeams || ratingSaving || groupingSaving"
-                          @update:modelValue="(v) => { tt.rating = v; updateTeamRating(tt.teamId, v) }"
-                        />
-                      </div>
-                    </template>
-                  </draggable>
-                </div>
-
-                <div class="rounded-lg border border-surface-200 p-3">
-                  <div class="flex items-center justify-between">
-                    <div class="text-sm font-medium">Группа B</div>
-                    <div class="text-xs text-muted-color">{{ groupB.length }}</div>
-                  </div>
-                  <draggable
-                    :list="groupB"
-                    item-key="teamId"
-                    group="teams-groups"
-                    handle=".drag-handle"
-                    :disabled="!canEditGroups || groupingSaving"
-                    :move="checkGroupMove"
-                    class="mt-2 space-y-2"
-                    @start="() => { preDragA.value = groupA.map((x) => x.teamId); preDragB.value = groupB.map((x) => x.teamId) }"
-                    @change="(e) => onGroupChange(e, groupIdB)"
-                  >
-                    <template #item="{ element: tt }">
-                      <div class="flex items-center justify-between rounded-md border border-surface-200 px-3 py-2">
-                        <div class="flex items-center gap-2">
-                          <span
-                            class="drag-handle pi pi-bars text-muted-color"
-                            :class="canEditGroups ? 'cursor-grab active:cursor-grabbing' : 'cursor-not-allowed opacity-50'"
-                            :title="canEditGroups ? 'Перетащить' : 'Недоступно после генерации'"
-                          />
-                          <div class="text-sm">{{ tt.team.name }}</div>
-                        </div>
-                        <Select
-                          :modelValue="tt.rating ?? 3"
-                          :options="ratingOptions"
-                          optionLabel="label"
-                          optionValue="value"
-                          class="w-20"
+                          class="w-20 shrink-0"
                           :disabled="!canEditTeams || ratingSaving || groupingSaving"
                           @update:modelValue="(v) => { tt.rating = v; updateTeamRating(tt.teamId, v) }"
                         />
@@ -1658,7 +2055,7 @@ onMounted(async () => {
               <li
                 v-for="tt in tournament?.tournamentTeams ?? []"
                 :key="tt.teamId"
-                class="flex items-center justify-between rounded-lg border border-surface-200 px-3 py-2"
+                class="flex items-center justify-between rounded-lg border border-surface-200 dark:border-surface-700 px-3 py-2"
               >
                 <div class="flex items-center gap-2">
                   <div class="text-sm">{{ tt.team.name }}</div>
@@ -1682,13 +2079,13 @@ onMounted(async () => {
             </ul>
           </div>
 
-          <div class="rounded-xl border border-surface-200 bg-surface-0 p-4">
-            <h2 class="text-sm font-semibold text-surface-900">Админы турнира</h2>
+          <div class="rounded-xl border border-surface-200 dark:border-surface-700 bg-surface-0 dark:bg-surface-900 p-4">
+            <h2 class="text-sm font-semibold text-surface-900 dark:text-surface-0">Админы турнира</h2>
             <ul class="mt-3 space-y-2">
               <li
                 v-for="m in tournament?.members ?? []"
                 :key="m.id"
-                class="rounded-lg border border-surface-200 px-3 py-2"
+                class="rounded-lg border border-surface-200 dark:border-surface-700 px-3 py-2"
               >
                 <div class="text-sm">
                   {{ m.user.name }}
@@ -1702,6 +2099,13 @@ onMounted(async () => {
       </TabPanel>
     </TabView>
 
+    <AdminConfirmDialog
+      v-model="deleteManualMatchConfirmOpen"
+      title="Удалить матч?"
+      :message="deleteManualMatchMessage"
+      @confirm="confirmDeleteManualMatch"
+    />
+
     <Dialog
       :visible="calendarDialog"
       @update:visible="(v) => (calendarDialog = v)"
@@ -1713,12 +2117,9 @@ onMounted(async () => {
         <div>
           <div class="flex items-center justify-between gap-3">
             <div>
-              <div class="text-sm font-medium text-surface-900">Формат турнира</div>
+              <div class="text-sm font-medium text-surface-900 dark:text-surface-0">Формат турнира</div>
               <div class="mt-1 text-sm text-muted-color">
-                {{
-                  formatOptions.find((x) => x.value === (tournament?.format ?? calendarForm.format))?.label ??
-                    (tournament?.format ?? calendarForm.format)
-                }}
+                {{ tournamentFormatLabel(tournament?.format ?? calendarForm.format) }}
               </div>
             </div>
             <div class="text-xs text-muted-color">
@@ -1726,8 +2127,8 @@ onMounted(async () => {
             </div>
           </div>
             <div
-              v-if="calendarForm.format === 'GROUPS_PLUS_PLAYOFF' || calendarForm.format === 'GROUPS_2'"
-              class="mt-2 rounded-lg border border-surface-200 p-3"
+              v-if="isGroupsPlusPlayoffFamily(calendarForm.format)"
+              class="mt-2 rounded-lg border border-surface-200 dark:border-surface-700 p-3"
             >
             <div class="flex items-center justify-between gap-3">
                 <div class="text-sm font-medium">Режим генерации</div>
@@ -1737,7 +2138,7 @@ onMounted(async () => {
                 Пресет `kids_mini_8`: 8 команд (2 группы по 4) + плей-офф.
             </div>
             <div v-if="calendarForm.useTemplate" class="mt-3 text-sm">
-              Используется пресет <span class="font-mono text-surface-900">kids_mini_8</span>.
+              Используется пресет <span class="font-mono text-surface-900 dark:text-surface-100">kids_mini_8</span>.
             </div>
           </div>
         </div>
@@ -1820,7 +2221,7 @@ onMounted(async () => {
             <div class="text-xs text-muted-color">Формат: HH:mm (например, 10:30)</div>
           </div>
         </div>
-        <div v-if="calendarForm.allowedDays?.length" class="rounded-lg border border-surface-200 p-3">
+        <div v-if="calendarForm.allowedDays?.length" class="rounded-lg border border-surface-200 dark:border-surface-700 p-3">
           <div class="text-sm font-medium">Время начала по дням (override)</div>
           <div class="mt-2 grid grid-cols-1 gap-3 md:grid-cols-2">
             <div
@@ -1851,7 +2252,13 @@ onMounted(async () => {
         </div>
       </div>
       <template #footer>
-        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div v-if="isManualFormat" class="flex justify-end gap-2">
+          <Button label="Закрыть" @click="calendarDialog = false" />
+        </div>
+        <div
+          v-else
+          class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"
+        >
           <div class="flex flex-wrap gap-2">
             <Button
               v-if="tournament?.matches?.length"
@@ -1863,7 +2270,7 @@ onMounted(async () => {
               @click="clearCalendar"
             />
             <Button
-              v-if="tournament?.format === 'GROUPS_PLUS_PLAYOFF' || tournament?.format === 'GROUPS_2' || tournament?.format === 'GROUPS_4'"
+              v-if="isGroupsPlusPlayoffFamily(tournament?.format)"
               label="Сгенерировать плей-офф"
               icon="pi pi-sitemap"
               severity="secondary"
@@ -1890,10 +2297,16 @@ onMounted(async () => {
       :visible="protocolOpen"
       @update:visible="(v) => (protocolOpen = v)"
       modal
-      header="Протокол матча"
+      :header="protocolReadOnly ? 'Протокол матча (только просмотр)' : 'Протокол матча'"
       :style="{ width: '36rem' }"
     >
       <div v-if="protocolMatch" class="space-y-4">
+        <p
+          v-if="protocolReadOnly"
+          class="text-sm text-muted-color rounded-lg border border-surface-200 dark:border-surface-600 bg-surface-50 dark:bg-surface-800/80 px-3 py-2"
+        >
+          Завершённый матч нельзя редактировать.
+        </p>
         <div class="text-sm">
           <span class="font-medium">
             {{ playoffSlotLabels(protocolMatch)?.home ?? protocolMatch.homeTeam.name }}
@@ -1912,17 +2325,46 @@ onMounted(async () => {
         <div class="grid grid-cols-2 gap-3">
           <div>
             <label class="text-sm block mb-1">Счёт (хозяева)</label>
-            <InputNumber v-model="protocolForm.homeScore" class="w-full" :min="0" />
+            <InputNumber
+              v-model="protocolForm.homeScore"
+              class="w-full"
+              :min="0"
+              :disabled="protocolReadOnly"
+            />
           </div>
           <div>
             <label class="text-sm block mb-1">Счёт (гости)</label>
-            <InputNumber v-model="protocolForm.awayScore" class="w-full" :min="0" />
+            <InputNumber
+              v-model="protocolForm.awayScore"
+              class="w-full"
+              :min="0"
+              :disabled="protocolReadOnly"
+            />
           </div>
         </div>
 
-        <div>
-          <label class="text-sm block mb-1">Дата и время матча</label>
-          <DatePicker v-model="protocolForm.startTime" class="w-full" showTime hourFormat="24" showIcon />
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-sm block mb-1">Дата матча</label>
+            <DatePicker
+              v-model="protocolDate"
+              class="w-full"
+              dateFormat="dd.mm.yy"
+              showIcon
+              :disabled="protocolReadOnly"
+            />
+          </div>
+          <div>
+            <label class="text-sm block mb-1">Время матча</label>
+            <DatePicker
+              v-model="protocolTime"
+              class="w-full"
+              timeOnly
+              hourFormat="24"
+              showIcon
+              :disabled="protocolReadOnly"
+            />
+          </div>
         </div>
 
         <div>
@@ -1933,13 +2375,21 @@ onMounted(async () => {
             option-label="label"
             option-value="value"
             class="w-full"
+            :disabled="protocolReadOnly"
           />
         </div>
 
         <div>
           <div class="flex items-center justify-between">
             <label class="text-sm font-medium">События</label>
-            <Button label="Добавить" icon="pi pi-plus" text size="small" @click="addEvent" />
+            <Button
+              label="Добавить"
+              icon="pi pi-plus"
+              text
+              size="small"
+              :disabled="protocolReadOnly"
+              @click="addEvent"
+            />
           </div>
 
           <div v-if="!protocolForm.events.length" class="mt-2 text-sm text-muted-color">
@@ -1950,33 +2400,35 @@ onMounted(async () => {
             <div
               v-for="(e, idx) in protocolForm.events"
               :key="idx"
-              class="rounded-lg border border-surface-200 p-3"
+              class="rounded-lg border border-surface-200 dark:border-surface-700 p-3"
             >
               <div class="grid grid-cols-1 gap-2 md:grid-cols-2">
                 <div>
                   <label class="text-xs block mb-1 text-muted-color">Тип</label>
-                  <Select
-                    v-model="e.type"
-                    :options="eventTypeOptions"
-                    option-label="label"
-                    option-value="value"
-                    class="w-full"
-                  />
+                <Select
+                  v-model="e.type"
+                  :options="eventTypeOptions"
+                  option-label="label"
+                  option-value="value"
+                  class="w-full"
+                  :disabled="protocolReadOnly"
+                />
                 </div>
                 <div>
                   <label class="text-xs block mb-1 text-muted-color">Команда</label>
-                  <Select
-                    v-model="e.teamSide"
-                    :options="teamSideOptions"
-                    option-label="label"
-                    option-value="value"
-                    class="w-full"
-                    @change="() => { e.playerId = '' }"
-                  />
+                <Select
+                  v-model="e.teamSide"
+                  :options="teamSideOptions"
+                  option-label="label"
+                  option-value="value"
+                  class="w-full"
+                  :disabled="protocolReadOnly"
+                  @change="() => { e.playerId = '' }"
+                />
                 </div>
                 <div>
                   <label class="text-xs block mb-1 text-muted-color">Минута</label>
-                  <InputNumber v-model="e.minute" class="w-full" :min="0" />
+                  <InputNumber v-model="e.minute" class="w-full" :min="0" :disabled="protocolReadOnly" />
                 </div>
                 <div>
                   <label class="text-xs block mb-1 text-muted-color">Игрок</label>
@@ -1988,7 +2440,7 @@ onMounted(async () => {
                     class="w-full"
                     placeholder="Выберите игрок"
                     :loading="protocolPlayersLoading"
-                    :disabled="protocolPlayersLoading || !e.teamSide"
+                    :disabled="protocolReadOnly || protocolPlayersLoading || !e.teamSide"
                   />
                 </div>
               </div>
@@ -1999,6 +2451,7 @@ onMounted(async () => {
                   text
                   severity="danger"
                   size="small"
+                  :disabled="protocolReadOnly"
                   @click="removeEvent(idx)"
                 />
               </div>
@@ -2009,9 +2462,16 @@ onMounted(async () => {
 
       <template #footer>
         <div class="flex justify-end gap-2">
-          <Button label="Отмена" text @click="protocolOpen = false" />
-          <Button label="Сохранить" icon="pi pi-check" :loading="protocolSaving" @click="saveProtocol" />
+          <Button label="Закрыть" text @click="protocolOpen = false" />
           <Button
+            v-if="!protocolReadOnly"
+            label="Сохранить"
+            icon="pi pi-check"
+            :loading="protocolSaving"
+            @click="saveProtocol"
+          />
+          <Button
+            v-if="!protocolReadOnly"
             label="Завершить"
             icon="pi pi-check-circle"
             severity="success"

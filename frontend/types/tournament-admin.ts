@@ -28,8 +28,11 @@ export interface TournamentDetails {
     team: { id: string; name: string }
     group?: { id: string; name: string } | null
     rating?: number | null
+    /** Порядок в колонке группы (для таблицы при равных очках). */
+    groupSortOrder?: number | null
   }[]
-  members: {
+  /** На публичном API не отдаётся. */
+  members?: {
     id: string
     role: string
     user: { id: string; email: string; name: string; role: string }
@@ -52,6 +55,7 @@ export interface TournamentDetails {
       minute?: number | null
       playerId?: string | null
       teamSide?: 'HOME' | 'AWAY' | null
+      payload?: Record<string, unknown> | null
     }[]
   }[]
   matchNumberById?: Record<string, number>
@@ -80,6 +84,11 @@ export interface TeamLite {
 
 export type MatchRow = TournamentDetails['matches'][number]
 export type MatchEventRow = NonNullable<MatchRow['events']>[number]
+
+/** Матч из GET /tenants/:tenantId/matches (в турнире, с полем tournament) */
+export type TenantTournamentMatchRow = MatchRow & {
+  tournament: { id: string; name: string; slug: string; format: string }
+}
 
 export type CalendarRound = {
   round: number
